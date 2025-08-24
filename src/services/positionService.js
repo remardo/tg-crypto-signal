@@ -27,6 +27,9 @@ class PositionService {
       
       // Subscribe to position updates
       await this.subscribeToPositionUpdates();
+      
+      // Start position sync service
+      await this.startPositionSync();
 
       logger.info('Position service initialized successfully');
       return true;
@@ -258,6 +261,39 @@ class PositionService {
         closeQuantity,
         account.bingxSubAccountId
       );
+
+      // If position was already closed on exchange, update it as closed in database
+      if (closeResult.status === 'already_closed') {
+        // Mark position as closed in database
+        await position.close(closePrice, 0, 0);
+        
+        // Update account P&L
+        await this.updateAccountPnl(account);
+
+        // Cache updated position
+        await this.cachePosition(position);
+
+        // Notify about position close
+        await this.notifyPositionClose(position, reason, closeResult);
+
+        tradeLog('position_closed', {
+          positionId: position.id,
+          symbol: position.symbol,
+          reason,
+          closePrice,
+          closeQuantity: 0,
+          realizedPnl: 0,
+          percentage: percentage * 100,
+          note: 'Position was already closed on exchange'
+        });
+
+        return {
+          success: true,
+          position: position.toJSON(),
+          closeResult,
+          realizedPnl: { pnl: 0, fees: 0, total: 0, tradeValue: 0 }
+        };
+      }
 
       // Calculate realized P&L
       const realizedPnl = this.calculateRealizedPnl(
@@ -686,6 +722,52 @@ class PositionService {
         isUpdating: false,
         error: error.message
       };
+    }
+  }
+
+  /**
+   * Sync all open positions with exchange
+   * @returns {Promise<void>}
+   */
+  async syncAllPositions() {
+    try {
+      logger.info('Starting position sync with exchange');
+      
+      // Get all open positions from database
+      const openPositions = await Position.getOpenPositions();
+      
+      let syncedCount = 0;
+      
+      // Sync each position
+      for (const position of openPositions) {
+        const wasSynced = await position.syncWithExchange(this.bingx);
+        if (wasSynced) {
+          syncedCount++;
+        }
+      }
+      
+      logger.info(`Position sync completed. ${syncedCount} positions synced.`);
+      
+    } catch (error) {
+      logger.error('Error during position sync:', error);
+    }
+  }
+
+  /**
+   * Start periodic position sync
+   * @returns {Promise<void>}
+   */
+  async startPositionSync() {
+    try {
+      // Sync every 30 minutes
+      setInterval(async () => {
+        await this.syncAllPositions();
+      }, 30 * 60 * 1000); // 30 minutes
+      
+      logger.info('Position sync scheduler started');
+      
+    } catch (error) {
+      logger.error('Error starting position sync:', error);
     }
   }
 

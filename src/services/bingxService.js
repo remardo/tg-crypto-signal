@@ -617,8 +617,15 @@ class BingXService {
       const positions = await this.getPositions(subAccountId);
       const position = positions.find(p => p.symbol === symbol);
       
+      // If no position found on exchange, return success with warning
       if (!position) {
-        throw new Error(`No position found for symbol ${symbol}`);
+        logger.warn(`No position found for symbol ${symbol} on exchange, treating as already closed`);
+        return { 
+          orderId: null, 
+          symbol, 
+          status: 'already_closed', 
+          message: `Position for ${symbol} not found on exchange` 
+        };
       }
 
       const closeQuantity = quantity || Math.abs(position.size);

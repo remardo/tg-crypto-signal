@@ -162,4 +162,17 @@ router.get('/active/summary',
   })
 );
 
+// Sync positions with exchange
+router.post('/sync',
+  asyncHandler(async (req, res) => {
+    const positionService = req.app.locals.services.position;
+    await positionService.syncAllPositions();
+    
+    res.json({
+      success: true,
+      message: 'Position sync initiated'
+    });
+  })
+);
+
 module.exports = router;

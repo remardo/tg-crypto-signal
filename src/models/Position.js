@@ -337,6 +337,47 @@ class Position {
     return str.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
   }
 
+  /**
+   * Sync position status with exchange
+   * @param {BingXService} bingxService - BingX service instance
+   * @returns {Promise<boolean>} - Whether position status was updated
+   */
+  async syncWithExchange(bingxService) {
+    try {
+      // Import Account model locally to avoid circular dependency
+      const Account = require('./Account');
+      
+      // Get account info
+      const account = await Account.findByChannelId(this.channelId);
+      if (!account) {
+        logger.warn(`Account not found for position ${this.id}`);
+        return false;
+      }
+
+      // Get positions from exchange
+      const positions = await bingxService.getPositions(account.bingxSubAccountId);
+      const exchangePosition = positions.find(p => p.symbol === this.symbol);
+      
+      // If position doesn't exist on exchange but is open in DB, close it
+      if (!exchangePosition && this.status === 'open') {
+        logger.info(`Position ${this.id} not found on exchange, marking as closed`);
+        await this.close(this.currentPrice || this.entryPrice, 0, 0);
+        return true;
+      }
+      
+      // If position exists on exchange but is closed in DB, this is an inconsistency
+      if (exchangePosition && this.status !== 'open') {
+        logger.warn(`Position ${this.id} exists on exchange but is closed in DB`);
+        return false;
+      }
+      
+      return false;
+    } catch (error) {
+      logger.error(`Error syncing position ${this.id} with exchange:`, error);
+      return false;
+    }
+  }
+
   toJSON() {
     return {
       id: this.id,
