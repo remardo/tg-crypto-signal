@@ -264,8 +264,54 @@ class PositionService {
 
       // If position was already closed on exchange, update it as closed in database
       if (closeResult.status === 'already_closed') {
-        // Mark position as closed in database
-        await position.close(closePrice, 0, 0);
+        // Try to get actual P&L from order history
+        let realizedPnlData = { pnl: 0, fees: 0, total: 0, tradeValue: 0 };
+        
+        try {
+          // Get recent order history for this symbol
+          const orderHistory = await this.bingx.getOrderHistory(position.symbol, 10, account.bingxSubAccountId);
+          
+          // Find orders that might be related to this position
+          const relatedOrders = orderHistory.filter(order => 
+            order.symbol === position.symbol && 
+            order.time > new Date(position.openedAt).getTime() &&
+            (order.side !== position.side || order.type === 'TAKE_PROFIT_MARKET' || order.type === 'STOP_MARKET')
+          );
+          
+          if (relatedOrders.length > 0) {
+            // Calculate approximate P&L from the most recent related order
+            const lastOrder = relatedOrders[0];
+            const executedQty = lastOrder.executedQty || lastOrder.quantity;
+            const avgPrice = lastOrder.avgPrice || lastOrder.price;
+            
+            if (executedQty > 0 && avgPrice > 0) {
+              // Calculate P&L based on position direction
+              let priceDiff;
+              if (position.side === 'BUY') {
+                priceDiff = new Decimal(avgPrice).minus(position.entryPrice);
+              } else {
+                priceDiff = new Decimal(position.entryPrice).minus(avgPrice);
+              }
+              
+              const pnl = priceDiff.times(executedQty).times(position.leverage || 1);
+              const tradeValue = new Decimal(avgPrice).times(executedQty);
+              const fees = tradeValue.times(0.001); // Approximate 0.1% fees
+              const netPnl = pnl.minus(fees);
+              
+              realizedPnlData = {
+                pnl: pnl.toNumber(),
+                fees: fees.toNumber(),
+                total: netPnl.toNumber(),
+                tradeValue: tradeValue.toNumber()
+              };
+            }
+          }
+        } catch (historyError) {
+          logger.warn(`Could not retrieve P&L from order history for position ${position.id}:`, historyError);
+        }
+        
+        // Mark position as closed in database with calculated or zero P&L
+        await position.close(closePrice, realizedPnlData.total, realizedPnlData.fees);
         
         // Update account P&L
         await this.updateAccountPnl(account);
@@ -282,16 +328,17 @@ class PositionService {
           reason,
           closePrice,
           closeQuantity: 0,
-          realizedPnl: 0,
+          realizedPnl: realizedPnlData.pnl,
           percentage: percentage * 100,
-          note: 'Position was already closed on exchange'
+          note: 'Position was already closed on exchange',
+          estimatedPnl: realizedPnlData.total
         });
 
         return {
           success: true,
           position: position.toJSON(),
           closeResult,
-          realizedPnl: { pnl: 0, fees: 0, total: 0, tradeValue: 0 }
+          realizedPnl: realizedPnlData
         };
       }
 
