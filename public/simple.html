@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Simple Test</title>
+    <style>
+        body { 
+            font-family: Arial, sans-serif; 
+            margin: 20px; 
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            background: #e9ecef;
+        }
+        .success { background: #d4edda; color: #155724; }
+        .error { background: #f8d7da; color: #721c24; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔧 Диагностика Crypto Trading Bot</h1>
+        
+        <div class="status">
+            <strong>Статус загрузки:</strong>
+            <div id="load-status">⏳ Загрузка...</div>
+        </div>
+        
+        <div class="status">
+            <strong>CSS статус:</strong>
+            <div id="css-status">⏳ Проверка...</div>
+        </div>
+        
+        <div class="status">
+            <strong>JavaScript статус:</strong>
+            <div id="js-status">⏳ Проверка...</div>
+        </div>
+        
+        <div class="status">
+            <strong>API статус:</strong>
+            <div id="api-status">⏳ Проверка...</div>
+        </div>
+        
+        <hr>
+        
+        <div class="status">
+            <strong>Результат диагностики:</strong>
+            <div id="final-result">⏳ Анализ...</div>
+        </div>
+    </div>
+
+    <script>
+        console.log('🔧 Начинаем диагностику...');
+        
+        // Проверка загрузки DOM
+        document.addEventListener('DOMContentLoaded', function() {
+            console.log('✅ DOM загружен');
+            document.getElementById('load-status').innerHTML = '✅ DOM загружен успешно';
+            document.getElementById('load-status').className = 'success';
+            
+            // Проверка CSS
+            setTimeout(checkCSS, 100);
+        });
+        
+        function checkCSS() {
+            console.log('🎨 Проверяем CSS...');
+            
+            try {
+                const testEl = document.createElement('div');
+                testEl.style.cssText = 'position: absolute; top: -1000px; width: 100px; height: 100px; background: red;';
+                document.body.appendChild(testEl);
+                
+                const computed = window.getComputedStyle(testEl);
+                if (computed.width === '100px' && computed.height === '100px') {
+                    document.getElementById('css-status').innerHTML = '✅ CSS работает корректно';
+                    document.getElementById('css-status').className = 'success';
+                    console.log('✅ CSS работает');
+                } else {
+                    throw new Error('CSS не применяется');
+                }
+                
+                document.body.removeChild(testEl);
+                setTimeout(checkJS, 100);
+                
+            } catch (error) {
+                console.error('❌ CSS ошибка:', error);
+                document.getElementById('css-status').innerHTML = '❌ Ошибка CSS: ' + error.message;
+                document.getElementById('css-status').className = 'error';
+            }
+        }
+        
+        function checkJS() {
+            console.log('📜 Проверяем JavaScript...');
+            
+            try {
+                // Тест современного JavaScript
+                const arr = [1, 2, 3];
+                const doubled = arr.map(x => x * 2);
+                const promise = new Promise(resolve => resolve('test'));
+                
+                if (doubled.length === 3 && typeof promise.then === 'function') {
+                    document.getElementById('js-status').innerHTML = '✅ JavaScript ES6+ поддерживается';
+                    document.getElementById('js-status').className = 'success';
+                    console.log('✅ JavaScript работает');
+                } else {
+                    throw new Error('ES6+ не поддерживается');
+                }
+                
+                setTimeout(checkAPI, 100);
+                
+            } catch (error) {
+                console.error('❌ JavaScript ошибка:', error);
+                document.getElementById('js-status').innerHTML = '❌ Ошибка JavaScript: ' + error.message;
+                document.getElementById('js-status').className = 'error';
+            }
+        }
+        
+        async function checkAPI() {
+            console.log('🌐 Проверяем API...');
+            
+            try {
+                const response = await fetch('/api/dashboard/stats');
+                const data = await response.json();
+                
+                if (data.success) {
+                    document.getElementById('api-status').innerHTML = '✅ API работает, данные получены';
+                    document.getElementById('api-status').className = 'success';
+                    console.log('✅ API работает:', data);
+                    
+                    showFinalResult(true);
+                } else {
+                    throw new Error('API вернул неверные данные');
+                }
+                
+            } catch (error) {
+                console.error('❌ API ошибка:', error);
+                document.getElementById('api-status').innerHTML = '❌ Ошибка API: ' + error.message;
+                document.getElementById('api-status').className = 'error';
+                
+                showFinalResult(false);
+            }
+        }
+        
+        function showFinalResult(success) {
+            const resultEl = document.getElementById('final-result');
+            
+            if (success) {
+                resultEl.innerHTML = '✅ Все компоненты работают! Основная проблема может быть в сложном CSS или конфликтах стилей.';
+                resultEl.className = 'success';
+                console.log('✅ Диагностика завершена успешно');
+            } else {
+                resultEl.innerHTML = '❌ Обнаружены проблемы. Проверьте консоль браузера для деталей.';
+                resultEl.className = 'error';
+                console.log('❌ Обнаружены проблемы');
+            }
+        }
+        
+        // Автозапуск если DOM уже загружен
+        if (document.readyState === 'loading') {
+            console.log('⏳ Ожидание загрузки DOM...');
+        } else {
+            console.log('✅ DOM уже загружен, запускаем проверки...');
+            document.getElementById('load-status').innerHTML = '✅ DOM загружен успешно';
+            document.getElementById('load-status').className = 'success';
+            setTimeout(checkCSS, 100);
+        }
+    </script>
+</body>
+</html>
