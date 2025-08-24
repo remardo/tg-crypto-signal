@@ -57,3 +57,25 @@ test-reports/
 # Temporary files
 temp/
 tmp/
+
+# Project specific
+settings.json
+*.log.*
+*.tmp
+*.temp
+
+# Debug and test files
+analyze_*.js
+check_*.js
+debug_*.js
+test_*.js
+execute_*.js
+automated_*.js
+validate_*.js
+cleanup_*.js
+create_*.js
+disable_*.js
+fix_*.js
+inspect_*.js
+*_test.js
+*_tests.js

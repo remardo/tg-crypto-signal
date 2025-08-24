@@ -1,8 +1,0 @@
-{
-  "telegramChannelId": "-1001234567890",
-  "name": "Test Channel",
-  "description": "Test channel for TP percentages",
-  "riskPercentage": 3.0,
-  "autoExecute": false,
-  "tpPercentages": [30.0, 40.0, 30.0]
-}
