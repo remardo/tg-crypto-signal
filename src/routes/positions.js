@@ -93,7 +93,7 @@ router.post('/:id/close',
     const { percentage = 1, reason = 'Manual close' } = req.body;
 
     const positionService = req.app.locals.services.position;
-    const result = await positionService.closePosition(id, percentage * 100, reason);
+    const result = await positionService.closePosition(id, reason, null, percentage);
 
     logger.info(`Position ${id} close initiated`, { percentage, reason });
 
@@ -171,6 +171,20 @@ router.post('/sync',
     res.json({
       success: true,
       message: 'Position sync initiated'
+    });
+  })
+);
+
+// Reset positions and P&L
+router.post('/reset',
+  asyncHandler(async (req, res) => {
+    const positionService = req.app.locals.services.position;
+    const result = await positionService.resetPositionsAndPnL();
+    
+    res.json({
+      success: true,
+      data: result,
+      message: 'Positions and P&L have been reset successfully'
     });
   })
 );

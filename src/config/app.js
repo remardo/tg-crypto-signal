@@ -59,7 +59,8 @@ const config = {
       account: '/openApi/swap/v2/user/balance',
       positions: '/openApi/swap/v2/user/positions',
       order: '/openApi/swap/v2/trade/order',
-      orderHistory: '/openApi/swap/v2/user/trades',
+      orderHistory: '/openApi/swap/v2/trade/allOrders',
+      income: '/openApi/swap/v2/user/income',
       // Note: BingX doesn't have dedicated sub-account APIs for perpetual trading
       // We'll simulate sub-accounts using position isolation
       subAccounts: '/openApi/account/v1/subAccount/list', // Updated endpoint

@@ -21,6 +21,7 @@ const signalRoutes = require('./routes/signals');
 const positionRoutes = require('./routes/positions');
 const dashboardRoutes = require('./routes/dashboard');
 const settingsRoutes = require('./routes/settings').router;
+const tradingRoutes = require('./routes/trading');
 
 // Import middleware
 const { errorHandler } = require('./middleware/errorHandler');
@@ -176,6 +177,7 @@ class Server {
     this.app.use('/api/positions', positionRoutes);
     this.app.use('/api/dashboard', dashboardRoutes);
     this.app.use('/api/settings', settingsRoutes);
+    this.app.use('/api/trading', tradingRoutes);
 
     // Root endpoint - serve the web interface
     this.app.get('/', (req, res) => {

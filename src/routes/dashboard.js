@@ -176,7 +176,7 @@ router.get('/overview',
       recentSignals
     ] = await Promise.all([
       channelService.getChannelStats(),
-      positionService.getPositionStatistics({}, period),
+      positionService.getPositionStats(null, period),
       positionService.getActivePositionsSummary({}),
       channelService.getRecentSignals ? channelService.getRecentSignals(10) : Promise.resolve([])
     ]);
@@ -237,7 +237,7 @@ router.get('/performance',
     ] = await Promise.all([
       positionService.getPerformanceMetrics(filters, period),
       positionService.getPnLTimeline(filters, period),
-      channelService.getTopPerformingChannels(period, 5)
+      channelService.getTopPerformingChannels ? channelService.getTopPerformingChannels(period, 5) : Promise.resolve([])
     ]);
 
     res.json({
@@ -246,7 +246,7 @@ router.get('/performance',
         period,
         metrics: performanceStats,
         timeline: pnlTimeline,
-        topChannels
+        topChannels: topChannels || []
       }
     });
   })
@@ -308,8 +308,8 @@ router.get('/activity',
       positionUpdates
     ] = await Promise.all([
       channelService.getRecentSignals ? channelService.getRecentSignals(parseInt(limit), period) : Promise.resolve([]),
-      positionService.getRecentTrades ? positionService.getRecentTrades(parseInt(limit), period) : Promise.resolve([]),
-      positionService.getRecentPositionUpdates ? positionService.getRecentPositionUpdates(parseInt(limit), period) : Promise.resolve([])
+      positionService.getRecentTrades(parseInt(limit), period),
+      positionService.getRecentPositionUpdates(parseInt(limit), period)
     ]);
 
     // Combine and sort by timestamp
@@ -333,6 +333,35 @@ router.get('/activity',
         }
       }
     });
+  })
+);
+
+// Get P&L by channel
+router.get('/pnl-by-channel',
+  asyncHandler(async (req, res) => {
+    try {
+      const positionService = req.app.locals.services.position;
+      
+      if (!positionService || !positionService.getPnLByChannel) {
+        return res.json({
+          success: true,
+          data: []
+        });
+      }
+
+      const pnlByChannel = await positionService.getPnLByChannel();
+      
+      res.json({
+        success: true,
+        data: pnlByChannel
+      });
+    } catch (error) {
+      logger.error('Failed to get P&L by channel:', error);
+      res.json({
+        success: true,
+        data: []
+      });
+    }
   })
 );
 

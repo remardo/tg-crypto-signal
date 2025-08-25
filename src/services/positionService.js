@@ -242,7 +242,9 @@ class PositionService {
 
       // Get current price if not provided
       if (!closePrice) {
-        const priceData = await this.bingx.getSymbolPrice(position.symbol);
+        // Format symbol to match BingX API requirements (e.g., "DYDX-USDT" instead of "DYDXUSDT")
+        const formattedSymbol = this.bingx.formatSymbol(position.symbol);
+        const priceData = await this.bingx.getSymbolPrice(formattedSymbol);
         closePrice = priceData.price;
       }
 
@@ -255,30 +257,64 @@ class PositionService {
         throw new Error('Account not found for position');
       }
 
+      // Format symbol to match BingX API requirements (e.g., "DYDX-USDT" instead of "DYDXUSDT")
+      const formattedSymbol = this.bingx.formatSymbol(position.symbol);
+      
       // Close position on BingX
       const closeResult = await this.bingx.closePosition(
-        position.symbol,
+        formattedSymbol,
         closeQuantity,
         account.bingxSubAccountId
       );
 
       // If position was already closed on exchange, update it as closed in database
       if (closeResult.status === 'already_closed') {
-        // Try to get actual P&L from order history
+        // Try to get actual P&L from exchange data
         let realizedPnlData = { pnl: 0, fees: 0, total: 0, tradeValue: 0 };
         
         try {
           // Get recent order history for this symbol
-          const orderHistory = await this.bingx.getOrderHistory(position.symbol, 10, account.bingxSubAccountId);
+          const orderHistory = await this.bingx.getOrderHistory(formattedSymbol, 20, account.bingxSubAccountId);
           
           // Find orders that might be related to this position
           const relatedOrders = orderHistory.filter(order => 
-            order.symbol === position.symbol && 
+            order.symbol === formattedSymbol && 
             order.time > new Date(position.openedAt).getTime() &&
             (order.side !== position.side || order.type === 'TAKE_PROFIT_MARKET' || order.type === 'STOP_MARKET')
           );
           
-          if (relatedOrders.length > 0) {
+          // Try to get income data directly from BingX (more accurate P&L data)
+          const incomeHistory = await this.bingx.getIncomeHistory({
+            symbol: formattedSymbol,
+            incomeType: 'REALIZED_PNL',
+            startTime: new Date(position.openedAt).getTime(),
+            limit: 50
+          }, account.bingxSubAccountId);
+          
+          // Sum up all realized P&L entries related to this position
+          let totalRealizedPnl = new Decimal(0);
+          let totalFees = new Decimal(0);
+          
+          if (incomeHistory && incomeHistory.length > 0) {
+            for (const income of incomeHistory) {
+              if (income.incomeType === 'REALIZED_PNL') {
+                totalRealizedPnl = totalRealizedPnl.plus(income.income);
+              } else if (income.incomeType === 'COMMISSION') {
+                totalFees = totalFees.plus(income.income);
+              }
+            }
+            
+            // If we found realized P&L data, use it
+            if (!totalRealizedPnl.isZero()) {
+              realizedPnlData.pnl = totalRealizedPnl.toNumber();
+              realizedPnlData.fees = Math.abs(totalFees.toNumber());
+              realizedPnlData.total = totalRealizedPnl.minus(totalFees).toNumber();
+              logger.info(`Retrieved realized P&L for position ${position.id} from income history: ${realizedPnlData.total}`);
+            }
+          }
+          
+          // If no P&L data from income history, try to calculate from order history
+          if (totalRealizedPnl.isZero() && relatedOrders.length > 0) {
             // Calculate approximate P&L from the most recent related order
             const lastOrder = relatedOrders[0];
             const executedQty = lastOrder.executedQty || lastOrder.quantity;
@@ -304,10 +340,11 @@ class PositionService {
                 total: netPnl.toNumber(),
                 tradeValue: tradeValue.toNumber()
               };
+              logger.info(`Calculated realized P&L for position ${position.id} from order history: ${realizedPnlData.total}`);
             }
           }
         } catch (historyError) {
-          logger.warn(`Could not retrieve P&L from order history for position ${position.id}:`, historyError);
+          logger.warn(`Could not retrieve P&L from history for position ${position.id}:`, historyError);
         }
         
         // Mark position as closed in database with calculated or zero P&L
@@ -324,7 +361,7 @@ class PositionService {
 
         tradeLog('position_closed', {
           positionId: position.id,
-          symbol: position.symbol,
+          symbol: formattedSymbol,
           reason,
           closePrice,
           closeQuantity: 0,
@@ -342,12 +379,56 @@ class PositionService {
         };
       }
 
-      // Calculate realized P&L
-      const realizedPnl = this.calculateRealizedPnl(
-        position,
-        closePrice,
-        closeQuantity
-      );
+      // First try to get realized P&L directly from BingX
+      let realizedPnl = { pnl: 0, fees: 0, total: 0, tradeValue: 0 };
+      
+      try {
+        // Try to get income data directly from BingX (accurate P&L data)
+        const startTime = Date.now() - 60000; // Start from 1 minute ago to capture the close operation
+        const incomeHistory = await this.bingx.getIncomeHistory({
+          symbol: formattedSymbol,
+          incomeType: 'REALIZED_PNL',
+          startTime: startTime,
+          limit: 10
+        }, account.bingxSubAccountId);
+        
+        // Find realized P&L entries from this close operation
+        if (incomeHistory && incomeHistory.length > 0) {
+          let totalRealizedPnl = new Decimal(0);
+          let totalFees = new Decimal(0);
+          
+          for (const income of incomeHistory) {
+            if (income.incomeType === 'REALIZED_PNL') {
+              totalRealizedPnl = totalRealizedPnl.plus(income.income);
+            } else if (income.incomeType === 'COMMISSION') {
+              totalFees = totalFees.plus(income.income);
+            }
+          }
+          
+          // If we found realized P&L data, use it
+          if (!totalRealizedPnl.isZero()) {
+            realizedPnl = {
+              pnl: totalRealizedPnl.toNumber(),
+              fees: Math.abs(totalFees.toNumber()),
+              total: totalRealizedPnl.minus(totalFees).toNumber(),
+              tradeValue: 0 // Will calculate this later if needed
+            };
+            logger.info(`Retrieved realized P&L for position ${position.id} from income history: ${realizedPnl.total}`);
+          }
+        }
+      } catch (incomeError) {
+        logger.warn(`Could not retrieve income history for position ${position.id}:`, incomeError);
+      }
+      
+      // If we couldn't get realized P&L from BingX, calculate it ourselves
+      if (realizedPnl.total === 0) {
+        realizedPnl = this.calculateRealizedPnl(
+          position,
+          closePrice,
+          closeQuantity
+        );
+        logger.info(`Calculated realized P&L for position ${position.id}: ${realizedPnl.total}`);
+      }
 
       // Update position in database
       if (percentage >= 1.0) {
@@ -369,7 +450,7 @@ class PositionService {
 
       tradeLog('position_closed', {
         positionId: position.id,
-        symbol: position.symbol,
+        symbol: formattedSymbol,
         reason,
         closePrice,
         closeQuantity,
@@ -451,6 +532,7 @@ class PositionService {
         throw new Error('No valid modifications provided');
       }
 
+  
       // Update position
       await position.update(updates);
 
@@ -468,6 +550,33 @@ class PositionService {
 
     } catch (error) {
       logger.error(`Error modifying position ${positionId}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Update a position with new data
+   * @param {string} positionId - The ID of the position to update
+   * @param {Object} updates - The updates to apply to the position
+   * @returns {Promise<Object>} The updated position
+   */
+  async updatePosition(positionId, updates) {
+    try {
+      const position = await Position.findById(positionId);
+      if (!position) {
+        return null;
+      }
+
+      // Update position in database
+      await position.update(updates);
+
+      // Cache updated position
+      await this.cachePosition(position);
+
+      return position.toJSON();
+
+    } catch (error) {
+      logger.error(`Error updating position ${positionId}:`, error);
       throw error;
     }
   }
@@ -502,8 +611,50 @@ class PositionService {
         offset
       });
 
+      // For open positions, sync with exchange to get real-time data
+      if (!status || status === 'open') {
+        const openPositions = positions.filter(p => p.status === 'open');
+        for (const position of openPositions) {
+          try {
+            // Get account for this position
+            const Account = require('../models/Account');
+            const account = await Account.findByChannelId(position.channelId);
+            if (account) {
+              // Get positions from exchange
+              const exchangePositions = await this.bingx.getPositions(account.bingxSubAccountId);
+              const exchangePosition = exchangePositions.find(p => p.symbol === position.symbol);
+              
+              if (exchangePosition) {
+                // Update position with real-time data from exchange
+                position.currentPrice = exchangePosition.markPrice;
+                position.unrealizedPnl = exchangePosition.unrealizedPnl;
+                position.quantity = exchangePosition.size;
+              }
+            }
+          } catch (error) {
+            logger.warn(`Could not sync position ${position.id} with exchange:`, error.message);
+          }
+        }
+      }
+
       return {
-        positions: positions.map(p => p.toJSON()),
+        positions: positions.map(p => {
+          const positionData = p.toJSON();
+          // Ensure consistent field naming for frontend
+          if (positionData.unrealizedPnl !== undefined) {
+            positionData.unrealized_pnl = positionData.unrealizedPnl;
+          }
+          if (positionData.realizedPnl !== undefined) {
+            positionData.realized_pnl = positionData.realizedPnl;
+          }
+          if (positionData.entryPrice !== undefined) {
+            positionData.entry_price = positionData.entryPrice;
+          }
+          if (positionData.currentPrice !== undefined) {
+            positionData.current_price = positionData.currentPrice;
+          }
+          return positionData;
+        }),
         total: positions.length,
         cached: false
       };
@@ -524,17 +675,47 @@ class PositionService {
       // Get orders for this position
       const orders = await position.getOrders();
       
-      // Get current price
+      // Get real-time data from exchange if position is open
       let currentPrice = position.currentPrice;
-      try {
-        const priceData = await this.bingx.getSymbolPrice(position.symbol);
-        currentPrice = priceData.price;
-      } catch (error) {
-        logger.warn('Could not get current price:', error.message);
+      let currentPnl = position.unrealizedPnl;
+      
+      if (position.status === 'open') {
+        try {
+          // Get account for this position
+          const Account = require('../models/Account');
+          const account = await Account.findByChannelId(position.channelId);
+          if (account) {
+            // Get positions from exchange
+            const exchangePositions = await this.bingx.getPositions(account.bingxSubAccountId);
+            const exchangePosition = exchangePositions.find(p => p.symbol === position.symbol);
+            
+            if (exchangePosition) {
+              currentPrice = exchangePosition.markPrice;
+              currentPnl = exchangePosition.unrealizedPnl;
+              
+              // Update position in database with real-time data
+              await position.updatePrice(currentPrice);
+            }
+          }
+        } catch (error) {
+          logger.warn(`Could not get real-time data for position ${positionId} from exchange:`, error.message);
+        }
       }
 
-      // Calculate current P&L
-      const currentPnl = position.calculateUnrealizedPnl(currentPrice);
+      // If we still don't have current price, try to get it from the price feed
+      if (!currentPrice) {
+        try {
+          const priceData = await this.bingx.getSymbolPrice(position.symbol);
+          currentPrice = priceData.price;
+        } catch (error) {
+          logger.warn('Could not get current price:', error.message);
+        }
+      }
+
+      // Calculate current P&L if we don't have it from exchange
+      if (currentPnl === undefined || currentPnl === null) {
+        currentPnl = position.calculateUnrealizedPnl(currentPrice);
+      }
 
       return {
         position: {
@@ -553,6 +734,66 @@ class PositionService {
     }
   }
 
+  async getPositionById(positionId) {
+    try {
+      const position = await Position.findById(positionId);
+      if (!position) {
+        return null;
+      }
+
+      // Get real-time data from exchange if position is open
+      let currentPrice = position.currentPrice;
+      let currentPnl = position.unrealizedPnl;
+      
+      if (position.status === 'open') {
+        try {
+          // Get account for this position
+          const account = await Account.findByChannelId(position.channelId);
+          if (account) {
+            // Get positions from exchange
+            const exchangePositions = await this.bingx.getPositions(account.bingxSubAccountId);
+            const exchangePosition = exchangePositions.find(p => p.symbol === position.symbol);
+            
+            if (exchangePosition) {
+              currentPrice = exchangePosition.markPrice;
+              currentPnl = exchangePosition.unrealizedPnl;
+              
+              // Update position in database with real-time data
+              await position.updatePrice(currentPrice);
+            }
+          }
+        } catch (error) {
+          logger.warn(`Could not get real-time data for position ${positionId} from exchange:`, error.message);
+        }
+      }
+
+      // If we still don't have current price, try to get it from the price feed
+      if (!currentPrice) {
+        try {
+          const priceData = await this.bingx.getSymbolPrice(position.symbol);
+          currentPrice = priceData.price;
+        } catch (error) {
+          logger.warn('Could not get current price:', error.message);
+        }
+      }
+
+      // Calculate current P&L if we don't have it from exchange
+      if (currentPnl === undefined || currentPnl === null) {
+        currentPnl = position.calculateUnrealizedPnl(currentPrice);
+      }
+
+      return {
+        ...position.toJSON(),
+        currentPrice,
+        currentPnl
+      };
+
+    } catch (error) {
+      logger.error('Error getting position by ID:', error);
+      throw error;
+    }
+  }
+
   async getPositionsByChannel(channelId, status = null) {
     try {
       const channel = await Channel.findById(channelId);
@@ -562,9 +803,34 @@ class PositionService {
 
       const positions = await channel.getPositions(status);
       
+      // For open positions, sync with exchange to get real-time data
+      if (!status || status === 'open') {
+        const openPositions = positions.filter(p => p.status === 'open');
+        for (const position of openPositions) {
+          try {
+            // Get account for this position
+            const Account = require('../models/Account');
+            const account = await Account.findByChannelId(position.channelId);
+            if (account) {
+              // Get positions from exchange
+              const exchangePositions = await this.bingx.getPositions(account.bingxSubAccountId);
+              const exchangePosition = exchangePositions.find(p => p.symbol === position.symbol);
+              
+              if (exchangePosition) {
+                // Update position with real-time data from exchange
+                position.currentPrice = exchangePosition.markPrice;
+                position.unrealizedPnl = exchangePosition.unrealizedPnl;
+              }
+            }
+          } catch (error) {
+            logger.warn(`Could not sync position ${position.id} with exchange:`, error.message);
+          }
+        }
+      }
+      
       return positions.map(p => ({
         ...p,
-        currentPnl: this.calculateCurrentPnl(p)
+        currentPnl: p.unrealizedPnl || this.calculateCurrentPnl(p)
       }));
 
     } catch (error) {
@@ -605,13 +871,19 @@ class PositionService {
   async cachePosition(position) {
     try {
       const cacheKey = `position:${position.id}`;
-      await redisUtils.set(cacheKey, position.toJSON(), 3600); // Cache for 1 hour
+      
+      // Handle both Position instances and plain objects
+      const positionData = typeof position.toJSON === 'function' 
+        ? position.toJSON() 
+        : position;
+      
+      await redisUtils.set(cacheKey, positionData, 3600); // Cache for 1 hour
       
       // Add to open positions list if position is open
-      if (position.status === 'open') {
-        await redisUtils.sAdd('open_positions', position.id);
+      if (positionData.status === 'open') {
+        await redisUtils.sAdd('open_positions', positionData.id);
       } else {
-        await redisUtils.sRem('open_positions', position.id);
+        await redisUtils.sRem('open_positions', positionData.id);
       }
 
     } catch (error) {
@@ -641,9 +913,14 @@ class PositionService {
 
   async notifyPositionClose(position, reason, closeResult) {
     try {
+      // Handle both Position instances and plain objects
+      const positionData = typeof position.toJSON === 'function' 
+        ? position.toJSON() 
+        : position;
+        
       const notification = {
         type: 'position_closed',
-        position: position.toJSON(),
+        position: positionData,
         reason,
         closeResult,
         timestamp: new Date()
@@ -747,6 +1024,775 @@ class PositionService {
 
     } catch (error) {
       logger.error('Error getting position stats:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get position statistics for dashboard and reporting
+   * @param {Object} filters - Filter parameters (channelId, symbol)
+   * @param {string} period - Time period (1h, 24h, 7d, 30d)
+   * @returns {Promise<Object>} Position statistics
+   */
+  async getPositionStatistics(filters = {}, period = '24h') {
+    try {
+      const { channel_id: channelId, symbol } = filters;
+      
+      // Build query conditions
+      let conditions = [];
+      let params = [];
+      let paramIndex = 1;
+      
+      // Time filter
+      let timeFilter = '';
+      switch (period) {
+        case '1h':
+          timeFilter = "opened_at >= NOW() - INTERVAL '1 hour'";
+          break;
+        case '24h':
+          timeFilter = "opened_at >= NOW() - INTERVAL '24 hours'";
+          break;
+        case '7d':
+          timeFilter = "opened_at >= NOW() - INTERVAL '7 days'";
+          break;
+        case '30d':
+          timeFilter = "opened_at >= NOW() - INTERVAL '30 days'";
+          break;
+        default:
+          timeFilter = "opened_at >= NOW() - INTERVAL '24 hours'";
+      }
+      conditions.push(timeFilter);
+      
+      // Channel filter
+      if (channelId) {
+        conditions.push(`channel_id = $${paramIndex}`);
+        params.push(channelId);
+        paramIndex++;
+      }
+      
+      // Symbol filter
+      if (symbol) {
+        conditions.push(`symbol = $${paramIndex}`);
+        params.push(symbol);
+        paramIndex++;
+      }
+      
+      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+      
+      // Main query for position statistics
+      const query = `
+        SELECT 
+          COUNT(*) as total,
+          COUNT(CASE WHEN status = 'open' THEN 1 END) as open,
+          COUNT(CASE WHEN status = 'closed' THEN 1 END) as closed,
+          COALESCE(SUM(realized_pnl), 0) as total_realized_pnl,
+          COALESCE(SUM(unrealized_pnl), 0) as total_unrealized_pnl,
+          COALESCE(SUM(CASE WHEN status = 'closed' THEN realized_pnl ELSE 0 END), 0) as closed_pnl,
+          COALESCE(SUM(CASE WHEN status = 'open' THEN unrealized_pnl ELSE 0 END), 0) as open_pnl
+        FROM positions 
+        ${whereClause}
+      `;
+      
+      const db = require('../database/connection');
+      const result = await db.query(query, params);
+      const stats = result.rows[0];
+      
+      // Get real-time P&L for open positions
+      let realtimeUnrealizedPnl = 0;
+      if (!channelId && !symbol) {
+        // Only get real-time data when no specific filters are applied
+        try {
+          const Channel = require('../models/Channel');
+          const channels = await Channel.findAll();
+          
+          for (const channel of channels) {
+            try {
+              const account = await Account.findByChannelId(channel.id);
+              if (account) {
+                const exchangePositions = await this.bingx.getPositions(account.bingxSubAccountId);
+                exchangePositions.forEach(pos => {
+                  realtimeUnrealizedPnl += pos.unrealizedPnl;
+                });
+              }
+            } catch (error) {
+              logger.warn(`Could not get exchange positions for channel ${channel.id}:`, error.message);
+            }
+          }
+        } catch (error) {
+          logger.warn('Could not get real-time P&L data:', error.message);
+        }
+      } else {
+        // Use database values when filters are applied
+        realtimeUnrealizedPnl = parseFloat(stats.total_unrealized_pnl);
+      }
+      
+      return {
+        total: parseInt(stats.total),
+        open: parseInt(stats.open),
+        closed: parseInt(stats.closed),
+        totalPnL: parseFloat(stats.total_realized_pnl) + realtimeUnrealizedPnl,
+        totalRealizedPnl: parseFloat(stats.total_realized_pnl),
+        totalUnrealizedPnl: realtimeUnrealizedPnl,
+        closedPnl: parseFloat(stats.closed_pnl),
+        openPnl: realtimeUnrealizedPnl,
+        totalVolume: 0, // Will be calculated separately
+        winRate: 0, // Will be calculated separately
+        period
+      };
+      
+    } catch (error) {
+      logger.error('Error getting position statistics:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get active positions summary
+   * @param {Object} filters - Filter parameters (channelId, status)
+   * @returns {Promise<Object>} Active positions summary
+   */
+  async getActivePositionsSummary(filters = {}) {
+    try {
+      const { channel_id: channelId } = filters;
+      
+      // Build query conditions
+      let conditions = ["status = 'open'"];
+      let params = [];
+      let paramIndex = 1;
+      
+      // Channel filter
+      if (channelId) {
+        conditions.push(`channel_id = $${paramIndex}`);
+        params.push(channelId);
+        paramIndex++;
+      }
+      
+      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+      
+      // Main query for active positions summary
+      const query = `
+        SELECT 
+          COUNT(*) as count,
+          COALESCE(SUM(quantity * entry_price), 0) as total_exposure,
+          COALESCE(SUM(unrealized_pnl), 0) as unrealized_pnl,
+          COALESCE(AVG(unrealized_pnl), 0) as avg_pnl
+        FROM positions 
+        ${whereClause}
+      `;
+      
+      const db = require('../database/connection');
+      const result = await db.query(query, params);
+      const summary = result.rows[0];
+      
+      // Get real-time data from exchange
+      let realtimeUnrealizedPnl = 0;
+      let realtimeTotalExposure = 0;
+      
+      try {
+        if (channelId) {
+          // Get specific channel data
+          const account = await Account.findByChannelId(channelId);
+          if (account) {
+            const exchangePositions = await this.bingx.getPositions(account.bingxSubAccountId);
+            exchangePositions.forEach(pos => {
+              realtimeUnrealizedPnl += pos.unrealizedPnl;
+              realtimeTotalExposure += (pos.size * pos.entryPrice);
+            });
+          }
+        } else {
+          // Get all channels data
+          const Channel = require('../models/Channel');
+          const channels = await Channel.findAll();
+          
+          for (const channel of channels) {
+            try {
+              const account = await Account.findByChannelId(channel.id);
+              if (account) {
+                const exchangePositions = await this.bingx.getPositions(account.bingxSubAccountId);
+                exchangePositions.forEach(pos => {
+                  realtimeUnrealizedPnl += pos.unrealizedPnl;
+                  realtimeTotalExposure += (pos.size * pos.entryPrice);
+                });
+              }
+            } catch (error) {
+              logger.warn(`Could not get exchange positions for channel ${channel.id}:`, error.message);
+            }
+          }
+        }
+      } catch (error) {
+        logger.warn('Could not get real-time position data:', error.message);
+        // Fallback to database values
+        realtimeUnrealizedPnl = parseFloat(summary.unrealized_pnl);
+        realtimeTotalExposure = parseFloat(summary.total_exposure);
+      }
+      
+      return {
+        count: parseInt(summary.count),
+        totalExposure: realtimeTotalExposure,
+        unrealizedPnl: realtimeUnrealizedPnl,
+        avgPnl: realtimeUnrealizedPnl > 0 ? realtimeUnrealizedPnl / parseInt(summary.count) : 0,
+        topPerformers: [], // Will be populated separately
+        worstPerformers: [] // Will be populated separately
+      };
+      
+    } catch (error) {
+      logger.error('Error getting active positions summary:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get P&L by channel for detailed reporting
+   * @returns {Promise<Array>} Array of channel P&L data
+   */
+  async getPnLByChannel() {
+    try {
+      // First get all channels
+      const Channel = require('../models/Channel');
+      const channels = await Channel.findAll();
+      
+      const channelPnLData = [];
+      
+      // For each channel, calculate real-time P&L
+      for (const channel of channels) {
+        try {
+          // Get account for this channel
+          const account = await Account.findByChannelId(channel.id);
+          if (!account) {
+            // If no account, use database values
+            channelPnLData.push({
+              channelId: channel.id,
+              channelName: channel.name,
+              totalPositions: 0,
+              openPositions: 0,
+              closedPositions: 0,
+              totalPnL: 0,
+              totalRealizedPnl: 0,
+              totalUnrealizedPnl: 0,
+              closedPnl: 0,
+              openPnl: 0
+            });
+            continue;
+          }
+          
+          // Get positions from exchange
+          const exchangePositions = await this.bingx.getPositions(account.bingxSubAccountId);
+          
+          // Get positions from database for this channel (both closed and partially closed)
+          const dbPositions = await channel.getPositions();
+          
+          let totalRealizedPnl = 0;
+          let totalUnrealizedPnl = 0;
+          let openPositionsCount = 0;
+          let closedPositionsCount = 0;
+          
+          // Process closed and partially closed positions from database
+          const closedPositions = dbPositions.filter(p => p.status === 'closed' || p.status === 'partially_closed');
+          closedPositions.forEach(position => {
+            totalRealizedPnl += parseFloat(position.realized_pnl || 0);
+            closedPositionsCount++;
+          });
+          
+          // Process open positions - use real-time data from exchange
+          const openPositions = dbPositions.filter(p => p.status === 'open');
+          openPositions.forEach(position => {
+            const exchangePosition = exchangePositions.find(p => p.symbol === position.symbol);
+            if (exchangePosition) {
+              totalUnrealizedPnl += exchangePosition.unrealizedPnl;
+            } else {
+              // Fallback to database value if not found on exchange
+              totalUnrealizedPnl += parseFloat(position.unrealized_pnl || 0);
+            }
+            openPositionsCount++;
+          });
+          
+          channelPnLData.push({
+            channelId: channel.id,
+            channelName: channel.name,
+            totalPositions: dbPositions.length,
+            openPositions: openPositionsCount,
+            closedPositions: closedPositionsCount,
+            totalPnL: totalRealizedPnl + totalUnrealizedPnl,
+            totalRealizedPnl: totalRealizedPnl,
+            totalUnrealizedPnl: totalUnrealizedPnl,
+            closedPnl: totalRealizedPnl,
+            openPnl: totalUnrealizedPnl
+          });
+        } catch (error) {
+          logger.warn(`Could not get P&L data for channel ${channel.id}:`, error.message);
+          // Add channel with zero values if there's an error
+          channelPnLData.push({
+            channelId: channel.id,
+            channelName: channel.name,
+            totalPositions: 0,
+            openPositions: 0,
+            closedPositions: 0,
+            totalPnL: 0,
+            totalRealizedPnl: 0,
+            totalUnrealizedPnl: 0,
+            closedPnl: 0,
+            openPnl: 0
+          });
+        }
+      }
+      
+      // Sort by total P&L descending
+      channelPnLData.sort((a, b) => b.totalPnL - a.totalPnL);
+      
+      return channelPnLData;
+      
+    } catch (error) {
+      logger.error('Error getting P&L by channel:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get performance metrics for positions
+   * @param {Object} filters - Filter parameters
+   * @param {string} period - Time period
+   * @returns {Promise<Object>} Performance metrics
+   */
+  async getPerformanceMetrics(filters = {}, period = '7d') {
+    try {
+      const { channel_id: channelId } = filters;
+      
+      // Build time filter
+      let timeFilter = '';
+      switch (period) {
+        case '1h':
+          timeFilter = "closed_at >= NOW() - INTERVAL '1 hour'";
+          break;
+        case '24h':
+          timeFilter = "closed_at >= NOW() - INTERVAL '24 hours'";
+          break;
+        case '7d':
+          timeFilter = "closed_at >= NOW() - INTERVAL '7 days'";
+          break;
+        case '30d':
+          timeFilter = "closed_at >= NOW() - INTERVAL '30 days'";
+          break;
+        default:
+          timeFilter = "closed_at >= NOW() - INTERVAL '7 days'";
+      }
+      
+      // Build query conditions
+      let conditions = [`status = 'closed' AND ${timeFilter}`];
+      let params = [];
+      let paramIndex = 1;
+      
+      // Channel filter
+      if (channelId) {
+        conditions.push(`channel_id = $${paramIndex}`);
+        params.push(channelId);
+        paramIndex++;
+      }
+      
+      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+      
+      // Main query for performance metrics
+      const query = `
+        SELECT 
+          COUNT(*) as total_trades,
+          COUNT(CASE WHEN realized_pnl > 0 THEN 1 END) as winning_trades,
+          COUNT(CASE WHEN realized_pnl < 0 THEN 1 END) as losing_trades,
+          COALESCE(SUM(realized_pnl), 0) as total_pnl,
+          COALESCE(AVG(realized_pnl), 0) as avg_trade_pnl,
+          COALESCE(MAX(realized_pnl), 0) as best_trade,
+          COALESCE(MIN(realized_pnl), 0) as worst_trade,
+          COALESCE(SUM(CASE WHEN realized_pnl > 0 THEN realized_pnl ELSE 0 END), 0) as total_winning,
+          COALESCE(SUM(CASE WHEN realized_pnl < 0 THEN ABS(realized_pnl) ELSE 0 END), 0) as total_losing
+        FROM positions 
+        ${whereClause}
+      `;
+      
+      const db = require('../database/connection');
+      const result = await db.query(query, params);
+      const metrics = result.rows[0];
+      
+      const totalTrades = parseInt(metrics.total_trades);
+      const winningTrades = parseInt(metrics.winning_trades);
+      const losingTrades = parseInt(metrics.losing_trades);
+      
+      const winRate = totalTrades > 0 ? (winningTrades / totalTrades) * 100 : 0;
+      const profitFactor = parseFloat(metrics.total_losing) > 0 ? 
+        parseFloat(metrics.total_winning) / parseFloat(metrics.total_losing) : 0;
+      
+      return {
+        totalTrades,
+        winningTrades,
+        losingTrades,
+        winRate: parseFloat(winRate.toFixed(2)),
+        totalPnl: parseFloat(metrics.total_pnl),
+        avgTradePnl: parseFloat(metrics.avg_trade_pnl),
+        bestTrade: parseFloat(metrics.best_trade),
+        worstTrade: parseFloat(metrics.worst_trade),
+        profitFactor: parseFloat(profitFactor.toFixed(2)),
+        period
+      };
+      
+    } catch (error) {
+      logger.error('Error getting performance metrics:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Reset all positions and P&L for testing and development purposes
+   * Closes all open positions on the exchange and deletes all closed positions from database
+   * @returns {Promise<Object>} Results of the reset operation
+   */
+  async resetPositionsAndPnL() {
+    try {
+      // Get database connection
+      const db = require('../database/connection');
+      
+      logger.info('Starting positions and P&L reset');
+      
+      // First, close all open positions on the exchange
+      const openPositions = await Position.getOpenPositions();
+      let closedOnExchangeCount = 0;
+      let failedToCloseCount = 0;
+      
+      logger.info(`Found ${openPositions.length} open positions to close`);
+      
+      for (const position of openPositions) {
+        try {
+          // Get account for this position
+          const account = await Account.findByChannelId(position.channelId);
+          if (account) {
+            logger.info(`Attempting to close position ${position.id} on exchange`, {
+              symbol: position.symbol,
+              channelId: position.channelId,
+              subAccountId: account.bingxSubAccountId
+            });
+            
+            // Close position on exchange
+            const closeResult = await this.bingx.closePosition(
+              position.symbol,
+              null, // Close full position
+              account.bingxSubAccountId
+            );
+            
+            if (closeResult && (closeResult.orderId || closeResult.status === 'already_closed')) {
+              closedOnExchangeCount++;
+              logger.info(`Successfully closed position ${position.id} on exchange`, {
+                symbol: position.symbol,
+                orderId: closeResult.orderId,
+                status: closeResult.status
+              });
+            } else {
+              logger.warn(`Position ${position.id} may not have closed properly`, {
+                symbol: position.symbol,
+                closeResult
+              });
+            }
+          } else {
+            logger.warn(`No account found for position ${position.id}`, {
+              channelId: position.channelId
+            });
+            failedToCloseCount++;
+          }
+        } catch (closeError) {
+          logger.error(`Error closing position ${position.id} on exchange:`, closeError);
+          failedToCloseCount++;
+        }
+      }
+      
+      logger.info(`Closed ${closedOnExchangeCount} positions on exchange, ${failedToCloseCount} failed to close`);
+      
+      // Now delete all positions (both closed and open) from database
+      const deleteResult = await db.query(`
+        DELETE FROM positions 
+        RETURNING id, status
+      `);
+      
+      const deletedCount = deleteResult.rowCount;
+      const closedPositionsCount = deleteResult.rows.filter(row => 
+        row.status === 'closed' || row.status === 'partially_closed'
+      ).length;
+      const openPositionsCount = deleteResult.rows.filter(row => 
+        row.status === 'open'
+      ).length;
+      
+      logger.info(`Deleted ${deletedCount} total positions (${closedPositionsCount} closed, ${openPositionsCount} open)`);
+      
+      // Clear Redis caches related to positions and P&L
+      await redisUtils.del('open_positions');
+      
+      // Clear the position cache
+      for (const row of deleteResult.rows) {
+        const positionId = row.id;
+        await redisUtils.del(`position:${positionId}`);
+        logger.info(`Cleared cache for position ${positionId}`);
+      }
+      
+      // Try to delete some common cache keys
+      await redisUtils.del('position_stats:all:24h');
+      await redisUtils.del('position_stats:all:7d');
+      await redisUtils.del('position_stats:all:30d');
+      
+      logger.info('Cleared position cache entries');
+      
+      // Publish notification about reset
+      await redisUtils.publish(CHANNELS.POSITION_UPDATE, {
+        type: 'positions_reset',
+        timestamp: new Date()
+      });
+      
+      return {
+        closedOnExchange: closedOnExchangeCount,
+        failedToClose: failedToCloseCount,
+        deletedPositions: deletedCount,
+        closedPositions: closedPositionsCount,
+        openPositions: openPositionsCount,
+        success: true
+      };
+      
+    } catch (error) {
+      logger.error('Error resetting positions and P&L:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get P&L timeline data for charting
+   * @param {Object} filters - Filter parameters
+   * @param {string} period - Time period
+   * @returns {Promise<Array>} P&L timeline data
+   */
+  async getPnLTimeline(filters = {}, period = '7d') {
+    try {
+      const { channel_id: channelId } = filters;
+      
+      // Build time filter and interval based on period
+      let timeFilter = '';
+      let interval = '';
+      switch (period) {
+        case '1h':
+          timeFilter = "closed_at >= NOW() - INTERVAL '1 hour'";
+          interval = '5 minutes';
+          break;
+        case '24h':
+          timeFilter = "closed_at >= NOW() - INTERVAL '24 hours'";
+          interval = '1 hour';
+          break;
+        case '7d':
+          timeFilter = "closed_at >= NOW() - INTERVAL '7 days'";
+          interval = '1 day';
+          break;
+        case '30d':
+          timeFilter = "closed_at >= NOW() - INTERVAL '30 days'";
+          interval = '1 day';
+          break;
+        default:
+          timeFilter = "closed_at >= NOW() - INTERVAL '7 days'";
+          interval = '1 day';
+      }
+      
+      // Build query conditions
+      let conditions = [`status = 'closed' AND ${timeFilter}`];
+      let params = [];
+      let paramIndex = 1;
+      
+      // Channel filter
+      if (channelId) {
+        conditions.push(`channel_id = $${paramIndex}`);
+        params.push(channelId);
+        paramIndex++;
+      }
+      
+      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+      
+      // Main query for P&L timeline
+      const query = `
+        SELECT 
+          DATE_TRUNC('${interval.replace(' ', '_')}', closed_at) as period,
+          COALESCE(SUM(realized_pnl), 0) as pnl,
+          COUNT(*) as trade_count
+        FROM positions 
+        ${whereClause}
+        GROUP BY DATE_TRUNC('${interval.replace(' ', '_')}', closed_at)
+        ORDER BY period
+      `;
+      
+      const db = require('../database/connection');
+      const result = await db.query(query, params);
+      
+      return result.rows.map(row => ({
+        period: row.period,
+        pnl: parseFloat(row.pnl),
+        tradeCount: parseInt(row.trade_count)
+      }));
+      
+    } catch (error) {
+      logger.error('Error getting P&L timeline:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get recent trades for activity feed
+   * @param {number} limit - Number of trades to return
+   * @param {string} period - Time period
+   * @returns {Promise<Array>} Recent trades
+   */
+  async getRecentTrades(limit = 20, period = '24h') {
+    try {
+      // Build time filter
+      let timeFilter = '';
+      switch (period) {
+        case '1h':
+          timeFilter = "closed_at >= NOW() - INTERVAL '1 hour'";
+          break;
+        case '24h':
+          timeFilter = "closed_at >= NOW() - INTERVAL '24 hours'";
+          break;
+        case '7d':
+          timeFilter = "closed_at >= NOW() - INTERVAL '7 days'";
+          break;
+        case '30d':
+          timeFilter = "closed_at >= NOW() - INTERVAL '30 days'";
+          break;
+        default:
+          timeFilter = "closed_at >= NOW() - INTERVAL '24 hours'";
+      }
+      
+      const query = `
+        SELECT 
+          id,
+          symbol,
+          side,
+          quantity,
+          entry_price,
+          current_price,
+          realized_pnl,
+          fees,
+          status,
+          closed_at,
+          created_at
+        FROM positions 
+        WHERE status = 'closed' AND ${timeFilter}
+        ORDER BY closed_at DESC
+        LIMIT $1
+      `;
+      
+      const db = require('../database/connection');
+      const result = await db.query(query, [limit]);
+      
+      return result.rows.map(row => ({
+        id: row.id,
+        symbol: row.symbol,
+        side: row.side,
+        quantity: parseFloat(row.quantity),
+        entryPrice: parseFloat(row.entry_price),
+        exitPrice: parseFloat(row.current_price),
+        pnl: parseFloat(row.realized_pnl),
+        fees: parseFloat(row.fees),
+        status: row.status,
+        closedAt: row.closed_at,
+        createdAt: row.created_at
+      }));
+      
+    } catch (error) {
+      logger.error('Error getting recent trades:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get recent position updates for activity feed
+   * @param {number} limit - Number of updates to return
+   * @param {string} period - Time period
+   * @returns {Promise<Array>} Recent position updates
+   */
+  async getRecentPositionUpdates(limit = 20, period = '24h') {
+    try {
+      // Build time filter
+      let timeFilter = '';
+      switch (period) {
+        case '1h':
+          timeFilter = "updated_at >= NOW() - INTERVAL '1 hour'";
+          break;
+        case '24h':
+          timeFilter = "updated_at >= NOW() - INTERVAL '24 hours'";
+          break;
+        case '7d':
+          timeFilter = "updated_at >= NOW() - INTERVAL '7 days'";
+          break;
+        case '30d':
+          timeFilter = "updated_at >= NOW() - INTERVAL '30 days'";
+          break;
+        default:
+          timeFilter = "updated_at >= NOW() - INTERVAL '24 hours'";
+      }
+      
+      const query = `
+        SELECT 
+          id,
+          symbol,
+          side,
+          quantity,
+          entry_price,
+          current_price,
+          unrealized_pnl,
+          status,
+          opened_at,
+          updated_at
+        FROM positions 
+        WHERE ${timeFilter}
+        ORDER BY updated_at DESC
+        LIMIT $1
+      `;
+      
+      const db = require('../database/connection');
+      const result = await db.query(query, [limit]);
+      
+      return result.rows.map(row => ({
+        id: row.id,
+        symbol: row.symbol,
+        side: row.side,
+        quantity: parseFloat(row.quantity),
+        entryPrice: parseFloat(row.entry_price),
+        currentPrice: parseFloat(row.current_price),
+        unrealizedPnl: parseFloat(row.unrealized_pnl),
+        status: row.status,
+        openedAt: row.opened_at,
+        updatedAt: row.updated_at
+      }));
+      
+    } catch (error) {
+      logger.error('Error getting recent position updates:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get P&L history for a specific position
+   * @param {string} positionId - Position ID
+   * @param {string} interval - Time interval for grouping
+   * @returns {Promise<Array>} P&L history data
+   */
+  async getPositionPnLHistory(positionId, interval = '1h') {
+    try {
+      // For now, we'll return a simplified P&L history
+      // In a real implementation, this would track P&L changes over time
+      const position = await Position.findById(positionId);
+      if (!position) {
+        throw new Error('Position not found');
+      }
+      
+      // Return current position data as history point
+      return [{
+        timestamp: new Date(),
+        price: position.currentPrice,
+        pnl: position.unrealizedPnl,
+        realizedPnl: position.realizedPnl,
+        fees: position.fees
+      }];
+      
+    } catch (error) {
+      logger.error('Error getting position P&L history:', error);
       throw error;
     }
   }

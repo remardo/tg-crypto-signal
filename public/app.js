@@ -221,6 +221,9 @@ class TradingBotInterface {
             // Load recent signals
             await this.loadRecentSignals();
             
+            // Load P&L by channel
+            await this.loadPnLByChannel();
+            
         } catch (error) {
             console.error('Failed to load dashboard:', error);
         }
@@ -235,7 +238,7 @@ class TradingBotInterface {
             document.getElementById('total-signals').textContent = stats.signalsToday || 0;
             document.getElementById('open-positions').textContent = stats.openPositions || 0;
             
-            const pnl = stats.totalPnl || 0;
+            const pnl = parseFloat(stats.totalPnl) || 0;
             const pnlElement = document.getElementById('total-pnl');
             pnlElement.textContent = `$${pnl.toFixed(2)}`;
             pnlElement.style.color = pnl >= 0 ? '#28a745' : '#dc3545';
@@ -317,6 +320,65 @@ class TradingBotInterface {
             console.error('Failed to load recent signals:', error);
             document.getElementById('recent-signals').innerHTML = 
                 '<p class="error">Ошибка загрузки сигналов</p>';
+        }
+    }
+
+    async loadPnLByChannel() {
+        try {
+            const response = await this.apiCall('/dashboard/pnl-by-channel');
+            const channelsPnL = response.data || [];
+            
+            const container = document.getElementById('channels-pnl');
+            
+            if (!channelsPnL || channelsPnL.length === 0) {
+                container.innerHTML = '<p class="loading">Нет данных по каналам</p>';
+                return;
+            }
+            
+            // Sort by P&L descending
+            channelsPnL.sort((a, b) => b.totalPnL - a.totalPnL);
+            
+            container.innerHTML = `
+                <div class="channels-pnl-header">
+                    <h3>P&L по каналам</h3>
+                    <button id="reset-pnl-btn" class="btn btn-danger btn-sm">Очистить позиции и P&L</button>
+                </div>
+                <div class="channels-pnl-grid">
+                    ${channelsPnL.map(channel => `
+                        <div class="channel-pnl-item">
+                            <div class="channel-name">${channel.channelName || 'Неизвестный канал'}</div>
+                            <div class="channel-pnl-values">
+                                <div class="pnl-value">
+                                    <span class="pnl-label">Общий P&L:</span>
+                                    <span class="pnl-amount ${(parseFloat(channel.totalPnL) || 0) >= 0 ? 'positive' : 'negative'}">
+                                        $${(parseFloat(channel.totalPnL) || 0).toFixed(2)}
+                                    </span>
+                                </div>
+                                <div class="pnl-value">
+                                    <span class="pnl-label">Реализованный:</span>
+                                    <span class="pnl-amount ${(parseFloat(channel.totalRealizedPnl) || 0) >= 0 ? 'positive' : 'negative'}">
+                                        $${(parseFloat(channel.totalRealizedPnl) || 0).toFixed(2)}
+                                    </span>
+                                </div>
+                                <div class="pnl-value">
+                                    <span class="pnl-label">Нереализованный:</span>
+                                    <span class="pnl-amount ${(parseFloat(channel.totalUnrealizedPnl) || 0) >= 0 ? 'positive' : 'negative'}">
+                                        $${(parseFloat(channel.totalUnrealizedPnl) || 0).toFixed(2)}
+                                    </span>
+                                </div>
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+            
+            // Add event listener to reset button
+            document.getElementById('reset-pnl-btn').addEventListener('click', this.handleResetPnL.bind(this));
+            
+        } catch (error) {
+            console.error('Failed to load P&L by channel:', error);
+            document.getElementById('channels-pnl').innerHTML = 
+                '<p class="error">Ошибка загрузки P&L по каналам</p>';
         }
     }
 
@@ -815,8 +877,8 @@ class TradingBotInterface {
                                 <td>${position.quantity}</td>
                                 <td>$${position.entry_price || 'N/A'}</td>
                                 <td>$${position.current_price || 'N/A'}</td>
-                                <td style="color: ${(position.unrealized_pnl || 0) >= 0 ? '#28a745' : '#dc3545'}">
-                                    $${(position.unrealized_pnl || 0).toFixed(2)}
+                                <td style="color: ${this.getPnlColor(position)}">
+                                    $${this.getPnlValue(position)}
                                 </td>
                                 <td>
                                     <span class="status-badge ${this.getStatusClass(position.status)}">
@@ -951,6 +1013,42 @@ class TradingBotInterface {
             // Revert checkbox state on error
             document.getElementById('disable-risk-management').checked = !disabled;
             this.updateRiskStatus(!disabled);
+        }
+    }
+    
+    async handleResetPnL() {
+        // Show confirmation dialog before resetting
+        const confirmed = confirm(
+            '⚠️ ВНИМАНИЕ! ⚠️\n\n' +
+            'Вы действительно хотите очистить все позиции?\n\n' +
+            'Это действие:\n' +
+            '- Удаляет все закрытые и частично закрытые позиции\n' +
+            '- Очищает кэш позиций\n\n' +
+            'Это действие необратимо.'
+        );
+        
+        if (!confirmed) {
+            return;
+        }
+        
+        try {
+            this.showLoading('channels-pnl', 'Очистка позиций и P&L...');
+            
+            // Call API to reset positions and P&L
+            const result = await this.apiCall('/positions/reset', {
+                method: 'POST'
+            });
+            
+            console.log('Reset result:', result);
+            
+            this.showSuccess(`Позиции успешно очищены. Удалено ${result.data.deletedPositions} позиций.`);
+            
+            // Reload dashboard data
+            await this.loadDashboard();
+            
+        } catch (error) {
+            console.error('Failed to reset positions and P&L:', error);
+            this.showError('Ошибка очистки позиций и P&L');
         }
     }
 
@@ -1095,6 +1193,39 @@ class TradingBotInterface {
             partially_closed: 'Частично закрыто'
         };
         return texts[status] || status;
+    }
+
+    // Helper method to get PnL value based on position status
+    getPnlValue(position) {
+        // For closed positions, use realizedPnl
+        if (position.status === 'closed') {
+            return (parseFloat(position.realizedPnl) || 0).toFixed(2);
+        }
+        // For partially closed positions, sum both values
+        else if (position.status === 'partially_closed') {
+            const total = (parseFloat(position.realizedPnl) || 0) + (parseFloat(position.unrealizedPnl) || 0);
+            return total.toFixed(2);
+        }
+        // For open positions, use unrealizedPnl
+        else {
+            return (parseFloat(position.unrealizedPnl) || 0).toFixed(2);
+        }
+    }
+
+    // Helper method to get PnL color based on value
+    getPnlColor(position) {
+        let pnlValue = 0;
+        
+        // Determine which PnL value to use based on position status
+        if (position.status === 'closed') {
+            pnlValue = parseFloat(position.realizedPnl) || 0;
+        } else if (position.status === 'partially_closed') {
+            pnlValue = (parseFloat(position.realizedPnl) || 0) + (parseFloat(position.unrealizedPnl) || 0);
+        } else {
+            pnlValue = parseFloat(position.unrealizedPnl) || 0;
+        }
+        
+        return pnlValue >= 0 ? '#28a745' : '#dc3545';
     }
 
     // TP Percentage Management
