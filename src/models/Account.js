@@ -1,6 +1,7 @@
 const db = require('../database/connection');
 const { v4: uuidv4 } = require('uuid');
 const Decimal = require('decimal.js');
+const { logger } = require('../utils/logger');
 
 class Account {
   constructor(data) {

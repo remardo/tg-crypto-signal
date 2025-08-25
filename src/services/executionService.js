@@ -1,3 +1,4 @@
+/* eslint-disable no-console */
 const { redisUtils, CHANNELS } = require('../config/redis');
 const { logger, trade: tradeLog } = require('../utils/logger');
 const Signal = require('../models/Signal');
@@ -17,6 +18,9 @@ class ExecutionService {
     this.isProcessing = false;
     this.maxConcurrentExecutions = 3;
     this.processingInterval = null;
+
+    // watchers for breakeven
+    this.breakevenWatchers = new Map(); // key: positionId, value: timer
   }
 
   async initialize() {
@@ -24,7 +28,6 @@ class ExecutionService {
       await this.bingx.initialize();
       await this.startExecutionProcessor();
       await this.subscribeToExecutionSignals();
-      await this.startBreakEvenMonitor();
       logger.info('Execution service initialized successfully');
       return true;
     } catch (error) {
@@ -72,7 +75,6 @@ class ExecutionService {
     try {
       await redisUtils.lPush('execution_queue', executionData);
       this.executionQueue.push(executionData);
-
       tradeLog('queued', {
         signalId: executionData.signalId,
         priority: executionData.priority,
@@ -86,23 +88,17 @@ class ExecutionService {
   async processExecutionQueue() {
     if (this.isProcessing) return;
     this.isProcessing = true;
-
     try {
       const available = this.maxConcurrentExecutions - this.activeExecutions.size;
-
-      for (let i = 0; i < available; i++) {
+      for (let i = 0; i < available; i += 1) {
         const executionData = await redisUtils.rPop('execution_queue');
         if (!executionData) break;
-
-        const executionId = `exec_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
-        this.activeExecutions.set(executionId, {
-          signalId: executionData.signalId,
-          status: 'running',
-          startTime: new Date()
+        this.executeSignal(
+          executionData.signalId,
+          `exec_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+        ).catch((error) => {
+          logger.error(`Execution error for signal ${executionData.signalId}:`, error);
         });
-
-        this.executeSignal(executionData.signalId, executionId)
-          .catch(err => logger.error(`Execution error for signal ${executionData.signalId}:`, err));
       }
     } catch (error) {
       logger.error('Error processing execution queue:', error);
@@ -112,8 +108,7 @@ class ExecutionService {
   }
 
   async executeSignal(signalId, executionId) {
-    let signal, channel, account, subAccountId;
-
+    let signal; let channel; let account; let subAccountId;
     try {
       logger.info('Executing signal', { signalId, executionId });
 
@@ -132,12 +127,11 @@ class ExecutionService {
       const riskChecks = await this.performRiskChecks(signal, channel, account);
       if (!riskChecks.passed) throw new Error(`Risk check failed: ${riskChecks.reason}`);
 
+      // Balance & symbol info
       const accountInfo = await this.bingx.getAccountInfo(subAccountId);
       const availableBalance = accountInfo.availableBalance;
-
       const symbol = this.formatSymbol(signal.coin);
 
-      // Contract info
       let symbolInfo;
       try {
         symbolInfo = await this.bingx.getSymbolInfo(symbol);
@@ -147,96 +141,73 @@ class ExecutionService {
           minQty: 0.001,
           maxQty: 1000000,
           stepSize: 0.001,
-          tickSize: 0.0001,
           minOrderValue: 5,
-          maxLeverage: 125
+          maxLeverage: 125,
+          pricePrecision: 6,
+          quantityPrecision: 4
         };
       }
 
+      // Position size = 10% депозита * плечо
       const riskManagementDisabled = await getRiskManagementStatus();
-
-      // Position size
       let positionSize = signal.customQuantity || this.calculatePositionSize(
         signal, channel, availableBalance, symbolInfo
       );
 
-      if (symbolInfo && symbolInfo.stepSize) {
-        const orig = positionSize;
-        positionSize = this.roundToStepSize(positionSize, symbolInfo.stepSize);
+      // округление к stepSize
+      if (symbolInfo.stepSize) {
+        const rounded = this.roundToStepSize(positionSize, symbolInfo.stepSize);
         logger.info('Rounded position size to step size', {
-          originalSize: orig,
-          roundedSize: positionSize,
-          stepSize: symbolInfo.stepSize,
-          symbol
+          originalSize: positionSize, roundedSize: rounded, stepSize: symbolInfo.stepSize, symbol
         });
+        positionSize = rounded;
       }
 
-      if (positionSize <= 0 && !riskManagementDisabled) {
-        throw new Error('Calculated position size is zero or negative');
-      } else if (positionSize <= 0 && riskManagementDisabled) {
-        logger.warn('Using minimum position size - risk management disabled', {
-          signalId: signal.id, originalSize: positionSize, symbol
-        });
-        const minOrderValue = symbolInfo.minOrderValue || 5;
-        let minQty = minOrderValue / Number(signal.entryPrice);
-        minQty = Math.max(minQty, symbolInfo.minQty || 0.001);
-        positionSize = symbolInfo.stepSize ? this.roundToStepSize(minQty, symbolInfo.stepSize) : minQty;
-        logger.info('Adjusted position size for execution', {
-          signalId: signal.id, adjustedSize: positionSize, symbol
-        });
+      if (positionSize <= 0 && !riskManagementDisabled) throw new Error('Calculated position size is zero or negative');
+      if (positionSize <= 0 && riskManagementDisabled) {
+        const mov = symbolInfo.minOrderValue || 5;
+        const minQty = mov / signal.entryPrice;
+        positionSize = this.roundToStepSize(Math.max(minQty, symbolInfo.minQty || 0.001), symbolInfo.stepSize || 0.001);
+        logger.warn('Using minimum position size - risk management disabled', { symbol, positionSize });
       }
 
       if (!riskManagementDisabled) {
-        const v = this.validateOrderParameters(signal, positionSize, symbolInfo, accountInfo);
-        if (!v.isValid) throw new Error(`Order validation failed: ${v.errors.join(', ')}`);
+        const validation = this.validateOrderParameters(signal, positionSize, symbolInfo, accountInfo);
+        if (!validation.isValid) throw new Error(`Order validation failed: ${validation.errors.join(', ')}`);
       } else {
-        logger.warn('Order parameter validation BYPASSED - risk management disabled', {
-          signalId: signal.id, positionSize, symbol
-        });
+        logger.warn('Order parameter validation BYPASSED - risk management disabled', { symbol, positionSize });
       }
 
-      // === ВАЖНО === Плечо ставим ДО ордера
-      if (signal.leverage && signal.leverage > 1) {
-        await this.setLeverageSafely(symbol, signal.leverage, subAccountId);
-      }
+      // set leverage (в отдельном запросе)
+      await this.setLeverageSafely(symbol, signal.leverage, subAccountId);
 
-      // Ордер
-      const orderResult = await this.placeOrder(
-        signal, positionSize, symbol, subAccountId, symbolInfo
-      );
+      // основной ордер
+      const effectiveSubAccountId = subAccountId && subAccountId !== 'main_account' ? subAccountId : null;
+      const orderResult = await this.placeOrder(signal, positionSize, symbol, effectiveSubAccountId);
 
-      // Позиция
-      const position = await this.createPosition(
-        signal, orderResult, account, positionSize, channel, subAccountId
-      );
+      // запись позиции
+      const position = await this.createPosition(signal, orderResult, account, positionSize, channel, subAccountId);
 
-      // Доп. защитные ордера (опционально)
-      await this.placeRiskManagementOrders(position, signal, subAccountId, channel);
+      // стоп и все ТП (TP1 дублируется – остаётся привязанным к главному ордеру, а для надёжности создадим отдельный TP_MARKET на TP2/TP3)
+      const rmOrders = await this.placeRiskManagementOrders(position, signal, subAccountId, channel, symbolInfo);
 
       await signal.execute();
       await this.notifyExecution(signal, position, orderResult);
 
       tradeLog('executed', {
-        signalId: signal.id,
-        positionId: position.id,
-        symbol,
-        side: orderResult.side || this.getOrderSide(signal.direction),
-        quantity: positionSize,
-        executedPrice: orderResult.executedPrice,
-        orderId: orderResult.orderId
+        signalId: signal.id, positionId: position.id, symbol, side: orderResult.side || this.getOrderSide(signal.direction),
+        quantity: positionSize, executedPrice: orderResult.executedPrice, orderId: orderResult.orderId
       });
 
-      return { success: true, position, order: orderResult };
+      return { success: true, position, order: orderResult, rmOrders };
     } catch (error) {
       logger.error(`Signal execution failed for ${signalId}:`, error);
-
       try {
         const s = await Signal.findById(signalId);
         if (s) await s.markAsFailed(error.message);
       } catch (updateError) {
         logger.error('Error updating signal status:', updateError);
       }
-
       tradeLog('execution_failed', { signalId, error: error.message, executionId });
       return { success: false, error: error.message };
     } finally {
@@ -246,8 +217,8 @@ class ExecutionService {
 
   async performRiskChecks(signal, channel, account) {
     try {
-      const riskOff = await getRiskManagementStatus();
-      if (riskOff) {
+      const riskManagementDisabled = await getRiskManagementStatus();
+      if (riskManagementDisabled) {
         logger.warn('Risk management is DISABLED - bypassing all risk checks!', {
           signalId: signal.id, coin: signal.coin, direction: signal.direction
         });
@@ -259,11 +230,9 @@ class ExecutionService {
       if (signal.confidenceScore < config.trading.minSignalConfidence) {
         return { passed: false, reason: `Signal confidence ${signal.confidenceScore} below minimum ${config.trading.minSignalConfidence}` };
       }
-
       if (accountInfo.availableBalance < config.trading.minTradeAmount) {
         return { passed: false, reason: `Insufficient balance: ${accountInfo.availableBalance} < ${config.trading.minTradeAmount} USDT` };
       }
-
       if (signal.leverage && signal.leverage > config.trading.maxLeverage) {
         return { passed: false, reason: `Leverage ${signal.leverage} exceeds maximum ${config.trading.maxLeverage}` };
       }
@@ -274,17 +243,13 @@ class ExecutionService {
       }
 
       const symbol = this.formatSymbol(signal.coin);
-      const existing = openPositions.find(p => p.symbol === symbol);
+      const existing = openPositions.find((p) => p.symbol === symbol);
       if (existing) return { passed: false, reason: `Position already exists for ${symbol}` };
 
       const rr = signal.calculateRiskReward();
-      if (rr && rr.ratio < 0.1) {
-        return { passed: false, reason: `Poor risk/reward ratio: ${rr.ratio.toFixed(2)}` };
-      }
+      if (rr && rr.ratio < 0.1) return { passed: false, reason: `Poor risk/reward ratio: ${rr.ratio.toFixed(2)}` };
 
-      if (accountInfo.marginRatio > 80) {
-        return { passed: false, reason: `High margin usage: ${accountInfo.marginRatio}%` };
-      }
+      if (accountInfo.marginRatio > 80) return { passed: false, reason: `High margin usage: ${accountInfo.marginRatio}%` };
 
       return { passed: true, checks: [] };
     } catch (error) {
@@ -293,73 +258,45 @@ class ExecutionService {
     }
   }
 
-  calculatePositionSize(signal, channel, availableBalance, symbolInfo = null) {
+  calculatePositionSize(signal, _channel, availableBalance, symbolInfo = null) {
     try {
       if (!signal.entryPrice) return 0;
-
-      const depositPct = 10;
+      const depositPercentage = 10;
       const leverage = signal.leverage || 1;
-
-      const riskAmount = new Decimal(availableBalance).times(depositPct).div(100);
+      const riskAmount = new Decimal(availableBalance).times(depositPercentage).div(100);
       const positionValue = riskAmount.times(leverage);
 
       const entryPrice = new Decimal(signal.entryPrice);
-      let qty = positionValue.div(entryPrice);
+      let finalQty = positionValue.div(entryPrice);
 
       logger.info('Position size calculation (new logic)', {
-        availableBalance,
-        depositPercentage: depositPct,
-        leverage,
-        riskAmount: riskAmount.toFixed(2),
-        positionValue: positionValue.toFixed(2),
-        entryPrice: entryPrice.toFixed(6),
-        calculatedQuantity: qty.toFixed(6),
-        symbol: signal.coin
+        availableBalance, depositPercentage, leverage, riskAmount: riskAmount.toFixed(2),
+        positionValue: positionValue.toFixed(2), entryPrice: entryPrice.toFixed(6),
+        calculatedQuantity: finalQty.toFixed(6), symbol: signal.coin
       });
 
       if (symbolInfo) {
-        const minQty = new Decimal(symbolInfo.minQty || 0.0001);
-        const step = new Decimal(symbolInfo.stepSize || 0.0001);
-
-        if (qty.lessThan(minQty)) {
-          logger.warn(`Calculated quantity ${qty.toFixed(8)} below exchange minimum ${minQty}, using minimum`, {
-            calculatedQuantity: qty.toFixed(8),
-            exchangeMinimum: minQty.toFixed(8),
-            coin: signal.coin
-          });
-          qty = minQty;
+        const exchangeMinQty = new Decimal(symbolInfo.minQty || 0.0001);
+        const stepSize = new Decimal(symbolInfo.stepSize || 0.0001);
+        if (finalQty.lessThan(exchangeMinQty)) {
+          finalQty = exchangeMinQty;
         }
-
-        const steps = qty.div(step).floor();
-        qty = steps.times(step);
-
-        if (qty.lessThan(minQty)) qty = minQty;
+        finalQty = finalQty.div(stepSize).floor().times(stepSize);
+        if (finalQty.lessThan(exchangeMinQty)) finalQty = exchangeMinQty;
 
         logger.info('Applied exchange requirements', {
-          minQty: minQty.toFixed(8),
-          stepSize: step.toFixed(8),
-          finalQuantity: qty.toFixed(8),
-          finalValue: qty.times(entryPrice).toFixed(2)
+          minQty: exchangeMinQty.toFixed(8), stepSize: stepSize.toFixed(8),
+          finalQuantity: finalQty.toFixed(8), finalValue: finalQty.times(entryPrice).toFixed(2)
         });
       } else {
         const minOrderValue = new Decimal(5);
-        const minQtyByValue = minOrderValue.div(entryPrice);
-        if (qty.lessThan(minQtyByValue)) {
-          logger.warn(`Calculated quantity ${qty.toFixed(8)} too small, using minimum $5 order`, {
-            calculatedQuantity: qty.toFixed(8),
-            minQuantity: minQtyByValue.toFixed(8),
-            entryPrice: entryPrice.toFixed(2)
-          });
-          qty = minQtyByValue;
-        }
+        const minQtyByVal = minOrderValue.div(entryPrice);
+        if (finalQty.lessThan(minQtyByVal)) finalQty = minQtyByVal;
       }
 
-      const result = qty.toNumber();
+      const result = finalQty.toNumber();
       logger.info('Final position size calculated', {
-        quantity: result,
-        estimatedValue: (result * signal.entryPrice).toFixed(2),
-        leverage,
-        symbol: signal.coin
+        quantity: result, estimatedValue: (result * signal.entryPrice).toFixed(2), leverage: signal.leverage || 1, symbol: signal.coin
       });
       return result;
     } catch (error) {
@@ -374,120 +311,98 @@ class ExecutionService {
       if (quantity < symbolInfo.minQty) errors.push(`Quantity ${quantity} below minimum ${symbolInfo.minQty}`);
       if (quantity > symbolInfo.maxQty) errors.push(`Quantity ${quantity} exceeds maximum ${symbolInfo.maxQty}`);
 
-      const step = symbolInfo.stepSize;
-      if (step > 0) {
-        const rounded = this.roundToStepSize(quantity, step);
+      const stepSize = symbolInfo.stepSize;
+      if (stepSize > 0) {
+        const rounded = this.roundToStepSize(quantity, stepSize);
         const diff = Math.abs(quantity - rounded);
-        const tol = step * 1e-6;
-        if (diff > tol) errors.push(`Quantity ${quantity} doesn't match step size ${step}`);
+        const tol = stepSize * 0.000001;
+        if (diff > tol) errors.push(`Quantity ${quantity} doesn't match step size ${stepSize}`);
       }
 
-      const lev = signal.leverage || 1;
-      const required = (Number(quantity) * Number(signal.entryPrice)) / lev;
-      if (required > accountInfo.availableBalance) {
-        errors.push(`Insufficient margin: required ${required}, available ${accountInfo.availableBalance}`);
+      const leverage = signal.leverage || 1;
+      const entryPrice = signal.entryPrice;
+      const requiredMargin = (quantity * entryPrice) / leverage;
+      if (requiredMargin > accountInfo.availableBalance) {
+        errors.push(`Insufficient margin: required ${requiredMargin}, available ${accountInfo.availableBalance}`);
       }
 
       if (signal.leverage && signal.leverage > symbolInfo.maxLeverage) {
         errors.push(`Leverage ${signal.leverage} exceeds symbol maximum ${symbolInfo.maxLeverage}`);
       }
-    } catch (e) {
-      errors.push(`Validation error: ${e.message}`);
+    } catch (error) {
+      errors.push(`Validation error: ${error.message}`);
     }
     return { isValid: errors.length === 0, errors };
   }
 
   async setLeverageSafely(symbol, leverage, subAccountId) {
-    const maxRetries = 2;
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        await this.bingx.setLeverage(symbol, leverage, subAccountId);
-        logger.info('Leverage set successfully', { symbol, leverage, subAccountId, attempt });
-        return;
-      } catch (e) {
-        logger.warn('Failed to set leverage, retrying...', { symbol, leverage, attempt, error: e.message });
-        if (attempt === maxRetries) throw e;
-        await new Promise(r => setTimeout(r, 350));
-      }
+    try {
+      if (!leverage || leverage <= 1) return;
+      await this.bingx.setLeverage(symbol, leverage, subAccountId);
+      logger.info('Leverage set', { symbol, leverage });
+    } catch (e) {
+      logger.warn(`Skipping leverage setting for ${symbol} due to API issues`, {
+        requestedLeverage: leverage, symbol
+      });
     }
   }
 
-  async placeOrder(signal, quantity, symbol, subAccountId, symbolInfo) {
+  async placeOrder(signal, quantity, symbol, subAccountId) {
     try {
-      const priceInfo = await this.bingx.getSymbolPrice(symbol);
-      const currentPrice = Number(priceInfo.price);
+      const currentPriceInfo = await this.bingx.getSymbolPrice(symbol);
+      const currentPrice = currentPriceInfo.price;
 
-      const step = symbolInfo?.stepSize || 0.001;
-      const tick = symbolInfo?.tickSize || 0.0001;
-
-      const qty = this.roundToStepSize(quantity, step);
-      const positionSide = signal.direction === 'LONG' ? 'LONG' : 'SHORT';
+      let stepSize = 0.001; let pricePrecision = 6;
+      try {
+        const info = await this.bingx.getSymbolInfo(symbol);
+        stepSize = info.stepSize || 0.001;
+        pricePrecision = info.pricePrecision || 6;
+      } catch (e) {
+        logger.warn(`Could not get symbol info for step/precision, using defaults`, { symbol, error: e.message });
+      }
 
       const orderData = {
         symbol,
         side: this.getOrderSide(signal.direction),
-        positionSide,             // важно для Hedge Mode
         type: 'MARKET',
-        quantity: qty,
+        quantity: this.roundToStepSize(quantity, stepSize),
         recvWindow: 5000,
-        clientOrderId: `sig${Date.now()}`
-        // ВАЖНО: НЕ передавать leverage здесь
+        clientOrderId: `sig_${Date.now()}`
       };
 
-      // helper: округление цены к тик-сайзу
-      const roundToTick = (p) => Math.floor(Number(p) / tick) * tick;
-      const tickDecimals = (String(tick).split('.')[1] || '').length;
-
-      // TP
+      // TP1
       if (signal.takeProfitLevels && signal.takeProfitLevels.length > 0) {
-        const rawTp = parseFloat(
-          typeof signal.takeProfitLevels[0] === 'object'
-            ? signal.takeProfitLevels[0].price
-            : signal.takeProfitLevels[0]
-        );
-        const tpPrice = Number(roundToTick(rawTp).toFixed(tickDecimals));
-        const tpOk = (signal.direction === 'LONG' && tpPrice > currentPrice)
-                  || (signal.direction === 'SHORT' && tpPrice < currentPrice);
-        if (tpOk) {
+        const tp1 = parseFloat(signal.takeProfitLevels[0]);
+        const ok = (signal.direction === 'LONG' && tp1 > currentPrice) || (signal.direction === 'SHORT' && tp1 < currentPrice);
+        if (ok) {
           orderData.takeProfit = JSON.stringify({
             type: 'TAKE_PROFIT_MARKET',
-            stopPrice: tpPrice,
+            stopPrice: tp1.toFixed(pricePrecision),
             workingType: 'MARK_PRICE'
           });
-          logger.info(`Added take profit at ${tpPrice} (current: ${currentPrice})`, {
-            symbol, direction: signal.direction, tpPrice, currentPrice
-          });
+          logger.info(`Added take profit to main order at ${tp1} (current: ${currentPrice})`, { symbol });
         } else {
-          logger.warn('Skipping take profit - invalid level for current price', {
-            symbol, direction: signal.direction, tpPrice, currentPrice
-          });
+          logger.warn('Skipping TP1 for main order - invalid level vs current price', { symbol, tp1, currentPrice });
         }
       }
 
       // SL
       if (signal.stopLoss) {
-        const rawSl = parseFloat(signal.stopLoss);
-        const slPrice = Number(roundToTick(rawSl).toFixed(tickDecimals));
-        const slOk = (signal.direction === 'LONG' && slPrice < currentPrice)
-                  || (signal.direction === 'SHORT' && slPrice > currentPrice);
-        if (slOk) {
+        const sl = parseFloat(signal.stopLoss);
+        const ok = (signal.direction === 'LONG' && sl < currentPrice) || (signal.direction === 'SHORT' && sl > currentPrice);
+        if (ok) {
           orderData.stopLoss = JSON.stringify({
             type: 'STOP_MARKET',
-            stopPrice: slPrice,
+            stopPrice: sl.toFixed(pricePrecision),
             workingType: 'MARK_PRICE'
           });
-          logger.info(`Added stop loss at ${slPrice} (current: ${currentPrice})`, {
-            symbol, direction: signal.direction, slPrice, currentPrice
-          });
+          logger.info(`Added stop loss to main order at ${sl} (current: ${currentPrice})`, { symbol });
         } else {
-          logger.warn('Skipping stop loss - invalid level for current price', {
-            symbol, direction: signal.direction, slPrice, currentPrice
-          });
+          logger.warn('Skipping SL for main order - invalid level vs current price', { symbol, sl, currentPrice });
         }
       }
 
-      const effectiveSub = subAccountId && subAccountId !== 'main_account' ? subAccountId : null;
-      const result = await this.bingx.placeOrder(orderData, effectiveSub);
+      const result = await this.bingx.placeOrder(orderData, subAccountId);
       return result;
     } catch (error) {
       logger.error('Error placing order:', error);
@@ -519,134 +434,108 @@ class ExecutionService {
     }
   }
 
-  async placeRiskManagementOrders(position, signal, subAccountId, channel) {
+  /**
+   * Создаём отдельный STOP_MARKET и TAKE_PROFIT_MARKET ордера (reduceOnly)
+   * + включаем watcher для переноса стопа в BE после первого частичного тейка
+   */
+  async placeRiskManagementOrders(position, signal, subAccountId, channel, symbolInfo) {
+    const orders = [];
     try {
-      const orders = [];
+      const effectiveSubAccountId = subAccountId && subAccountId !== 'main_account' ? subAccountId : null;
+      const pricePrecision = symbolInfo?.pricePrecision || 6;
+      const stepSize = symbolInfo?.stepSize || 0.001;
 
+      // ---- STOP LOSS ----
+      let slOrderId = null;
       if (signal.stopLoss) {
         try {
+          const stopLossPrice = parseFloat(signal.stopLoss);
           const stopLossOrder = {
             symbol: position.symbol,
             side: position.side === 'BUY' ? 'SELL' : 'BUY',
             positionSide: position.side === 'BUY' ? 'LONG' : 'SHORT',
             type: 'STOP_MARKET',
-            stopPrice: signal.stopLoss,
+            stopPrice: stopLossPrice.toFixed(pricePrecision),
             workingType: 'MARK_PRICE',
-            quantity: position.quantity,
+            quantity: this.roundToStepSize(position.quantity, stepSize),
             reduceOnly: true,
             recvWindow: 5000,
-            clientOrderId: `sl${Date.now()}`
+            clientOrderId: `sl_${Date.now()}`
           };
-
-          const effectiveSub = subAccountId && subAccountId !== 'main_account' ? subAccountId : null;
-          const slResult = await this.bingx.placeOrder(stopLossOrder, effectiveSub);
-          orders.push({ type: 'stop_loss', order: slResult, orderId: slResult.orderId });
-
-          logger.info('Successfully placed stop-loss order', {
-            symbol: position.symbol,
-            stopPrice: signal.stopLoss,
-            side: stopLossOrder.side,
-            positionSide: stopLossOrder.positionSide,
-            orderId: slResult.orderId
+          const slRes = await this.bingx.placeOrder(stopLossOrder, effectiveSubAccountId);
+          slOrderId = slRes?.orderId || null;
+          orders.push({ type: 'stop_loss', order: slRes });
+          logger.info('Placed STOP_MARKET stop-loss', {
+            symbol: position.symbol, stopPrice: stopLossOrder.stopPrice, orderId: slRes?.orderId
           });
         } catch (error) {
-          logger.error('Error placing stop-loss order:', error);
+          logger.error('Error placing STOP_MARKET stop-loss order:', error);
         }
       }
 
-      if (signal.takeProfitLevels && signal.takeProfitLevels.length > 0) {
-        const tpPercentages = channel.tpPercentages || [25.0, 25.0, 50.0];
+      // ---- TAKE PROFITS (TP2..n) ----
+      const tpPercentages = channel.tpPercentages || [25.0, 25.0, 50.0];
+      const levels = Array.isArray(signal.takeProfitLevels) ? signal.takeProfitLevels : [];
+      const sortedTp = [...levels].map(x => (typeof x === 'object' ? parseFloat(x.price) : parseFloat(x)))
+        .filter((v) => Number.isFinite(v))
+        .sort((a, b) => (position.side === 'BUY' ? a - b : b - a));
+
+      // распределяем количества
+      const originalQty = this.roundToStepSize(position.quantity, stepSize);
+      let remainingQty = originalQty;
+
+      for (let i = 1; i < sortedTp.length; i += 1) { // с TP2
+        const tpPrice = sortedTp[i];
+        let tpQty = this.calculateTPQuantity(originalQty, i, tpPercentages);
+
+        // min order value защитно (BingX ~3.72 USDT)
         const minOrderValue = 3.72;
-
-        const sorted = [...signal.takeProfitLevels].sort((a, b) => {
-          const ap = typeof a === 'object' ? parseFloat(a.price) : parseFloat(a);
-          const bp = typeof b === 'object' ? parseFloat(b.price) : parseFloat(b);
-          return position.side === 'BUY' ? ap - bp : bp - ap;
-        });
-
-        const viable = [];
-        let remaining = position.quantity;
-
-        for (let i = 0; i < sorted.length; i++) {
-          const lvl = sorted[i];
-          const price = typeof lvl === 'object' ? parseFloat(lvl.price) : parseFloat(lvl);
-          let qty = this.calculateTPQuantity(position.quantity, i, tpPercentages);
-          const minQtyForValue = minOrderValue / price;
-
-          if (qty * price < minOrderValue) {
-            if (minQtyForValue <= remaining) {
-              qty = minQtyForValue;
-            } else if (remaining * price >= minOrderValue) {
-              qty = remaining;
-            } else {
-              logger.warn(`Skipping TP${i + 1} - insufficient remaining quantity for minimum order value`, {
-                remainingQuantity: remaining, requiredQuantity: minQtyForValue, minOrderValue, price
-              });
-              continue;
-            }
-          }
-
-          viable.push({ index: i + 1, price, quantity: qty, value: qty * price });
-          remaining -= qty;
-          if (remaining <= 0) break;
-        }
-
-        for (const v of viable) {
-          try {
-            const tpOrder = {
-              symbol: position.symbol,
-              side: position.side === 'BUY' ? 'SELL' : 'BUY',
-              positionSide: position.side === 'BUY' ? 'LONG' : 'SHORT',
-              type: 'TAKE_PROFIT_MARKET',
-              stopPrice: v.price,
-              workingType: 'MARK_PRICE',
-              quantity: v.quantity,
-              reduceOnly: true,
-              recvWindow: 5000,
-              clientOrderId: `tp${v.index}_${Date.now()}`
-            };
-
-            const effectiveSub = subAccountId && subAccountId !== 'main_account' ? subAccountId : null;
-            const tpResult = await this.bingx.placeOrder(tpOrder, effectiveSub);
-            orders.push({ type: `take_profit_${v.index}`, order: tpResult, orderId: tpResult.orderId });
-
-            logger.info(`Successfully placed TP${v.index} order`, {
-              quantity: v.quantity,
-              price: v.price,
-              value: v.value.toFixed(2),
-              orderId: tpResult.orderId,
-              side: tpOrder.side,
-              positionSide: tpOrder.positionSide,
-              type: tpOrder.type,
-              reduceOnly: tpOrder.reduceOnly
-            });
-          } catch (error) {
-            logger.error(`Error placing take-profit order ${v.index}:`, error);
+        if ((tpQty * tpPrice) < minOrderValue) {
+          const minQtyForValue = minOrderValue / tpPrice;
+          if (minQtyForValue <= remainingQty) tpQty = minQtyForValue;
+          else if ((remainingQty * tpPrice) >= minOrderValue) tpQty = remainingQty;
+          else {
+            logger.warn(`Skipping TP${i + 1} - below minimal order value`, { tpPrice, remainingQty });
+            continue;
           }
         }
 
-        if (viable.length === 0) {
-          logger.warn('No viable take profit orders could be created due to minimum order value requirements', {
-            positionQuantity: position.quantity,
-            minOrderValue,
-            symbol: position.symbol
+        tpQty = this.roundToStepSize(Math.min(tpQty, remainingQty), stepSize);
+        if (tpQty <= 0) continue;
+
+        const takeProfitOrder = {
+          symbol: position.symbol,
+          side: position.side === 'BUY' ? 'SELL' : 'BUY',
+          positionSide: position.side === 'BUY' ? 'LONG' : 'SHORT',
+          type: 'TAKE_PROFIT_MARKET',
+          stopPrice: tpPrice.toFixed(pricePrecision),
+          workingType: 'MARK_PRICE',
+          quantity: tpQty,
+          reduceOnly: true,
+          recvWindow: 5000,
+          clientOrderId: `tp${i + 1}_${Date.now()}`
+        };
+
+        try {
+          const tpRes = await this.bingx.placeOrder(takeProfitOrder, effectiveSubAccountId);
+          orders.push({ type: `take_profit_${i + 1}`, order: tpRes });
+          remainingQty = this.roundToStepSize(remainingQty - tpQty, stepSize);
+          logger.info(`Placed TP${i + 1} TAKE_PROFIT_MARKET`, {
+            price: takeProfitOrder.stopPrice, qty: takeProfitOrder.quantity, orderId: tpRes?.orderId
           });
-        } else {
-          logger.info(`Created ${viable.length} take profit orders out of ${sorted.length} levels`, {
-            totalValue: viable.reduce((s, x) => s + x.value, 0).toFixed(2),
-            remainingQuantity: Math.max(0, remaining),
-            takeProfitPrices: viable.map(x => ({ index: x.index, price: x.price })),
-            positionSide: position.side,
-            positionDirection: position.side === 'BUY' ? 'LONG' : 'SHORT'
-          });
+        } catch (e) {
+          logger.error(`Error placing TP${i + 1} TAKE_PROFIT_MARKET:`, e);
         }
       }
 
-      // Store order information for break-even functionality
-      if (orders.length > 0) {
-        await this.storePositionOrders(position.id, orders);
+      // watcher для переустановки SL в BE после первого частичного тейка
+      if (signal.stopLoss && slOrderId) {
+        this.startBreakevenWatcher(position, slOrderId, effectiveSubAccountId, pricePrecision, stepSize);
       }
 
+      if (orders.length === 0) {
+        logger.warn('No risk-management orders were placed (check TP/SL levels and min order value)');
+      }
       return orders;
     } catch (error) {
       logger.error('Error placing risk management orders:', error);
@@ -654,141 +543,83 @@ class ExecutionService {
     }
   }
 
-  async storePositionOrders(positionId, orders) {
-    try {
-      // Store order information in Redis for later retrieval
-      const orderData = {
-        positionId,
-        orders,
-        createdAt: new Date().toISOString()
-      };
-      await redisUtils.set(`position_orders:${positionId}`, JSON.stringify(orderData));
-      logger.info('Stored position orders for break-even tracking', { positionId });
-    } catch (error) {
-      logger.error('Error storing position orders:', error);
-    }
-  }
+  startBreakevenWatcher(position, slOrderId, subAccountId, pricePrecision, stepSize) {
+    const key = position.id || `${position.symbol}:${Date.now()}`;
+    if (this.breakevenWatchers.has(key)) return;
 
-  async moveStopLossToBreakEven(positionId, entryPrice, subAccountId) {
-    try {
-      // Retrieve stored order information
-      const orderDataStr = await redisUtils.get(`position_orders:${positionId}`);
-      if (!orderDataStr) {
-        logger.warn('No order data found for position', { positionId });
-        return;
-      }
+    const pollMs = 4000;
+    const maxMs = 30 * 60 * 1000;
+    const startAt = Date.now();
+    const initialQty = this.roundToStepSize(position.quantity, stepSize);
+    const entryPrice = Number(position.entryPrice);
 
-      const orderData = JSON.parse(orderDataStr);
-      const stopLossOrder = orderData.orders.find(order => order.type === 'stop_loss');
-      
-      if (!stopLossOrder) {
-        logger.warn('No stop-loss order found for position', { positionId });
-        return;
-      }
-
-      // Cancel existing stop-loss order
+    const timer = setInterval(async () => {
       try {
-        await this.bingx.cancelOrder(stopLossOrder.orderId, orderData.orders[0].order.symbol, subAccountId);
-        logger.info('Cancelled old stop-loss order', { orderId: stopLossOrder.orderId });
-      } catch (error) {
-        logger.error('Error cancelling stop-loss order:', error);
-        return;
-      }
-
-      // Place new stop-loss order at break-even (entry price)
-      const newStopLossOrder = {
-        symbol: orderData.orders[0].order.symbol,
-        side: stopLossOrder.order.side,
-        positionSide: stopLossOrder.order.positionSide,
-        type: 'STOP_MARKET',
-        stopPrice: entryPrice.toString(),
-        workingType: 'MARK_PRICE',
-        quantity: stopLossOrder.order.quantity,
-        reduceOnly: true,
-        recvWindow: 5000,
-        clientOrderId: `breakeven_${Date.now()}`
-      };
-
-      const effectiveSub = subAccountId && subAccountId !== 'main_account' ? subAccountId : null;
-      const result = await this.bingx.placeOrder(newStopLossOrder, effectiveSub);
-      
-      logger.info('Moved stop-loss to break-even', {
-        positionId,
-        entryPrice,
-        newOrderId: result.orderId
-      });
-
-      // Update stored order information
-      const updatedOrders = orderData.orders.map(order => 
-        order.type === 'stop_loss' ? { ...order, orderId: result.orderId } : order
-      );
-      
-      await this.storePositionOrders(positionId, updatedOrders);
-    } catch (error) {
-      logger.error('Error moving stop-loss to break-even:', error);
-    }
-  }
-
-  async checkTakeProfitExecutions() {
-    try {
-      // Get all open positions
-      const openPositions = await Position.getOpenPositions();
-      
-      for (const position of openPositions) {
-        try {
-          // Get stored order information for this position
-          const orderDataStr = await redisUtils.get(`position_orders:${position.id}`);
-          if (!orderDataStr) continue;
-          
-          const orderData = JSON.parse(orderDataStr);
-          const takeProfitOrders = orderData.orders.filter(order => order.type.startsWith('take_profit'));
-          
-          if (takeProfitOrders.length === 0) continue;
-          
-          // Get account info to determine sub-account
-          const account = await Account.findByChannelId(position.channelId);
-          const subAccountId = account ? account.bingxSubAccountId || null : null;
-          
-          // Check if any take-profit orders have been filled
-          const openOrders = await this.bingx.getOpenOrders(position.symbol, subAccountId);
-          const filledTpOrders = takeProfitOrders.filter(tpOrder => 
-            !openOrders.some(openOrder => openOrder.orderId === tpOrder.orderId)
-          );
-          
-          if (filledTpOrders.length > 0) {
-            logger.info('Take-profit order(s) filled, moving stop-loss to break-even', {
-              positionId: position.id,
-              filledOrders: filledTpOrders.map(o => o.orderId)
-            });
-            
-            // Move stop-loss to break-even
-            await this.moveStopLossToBreakEven(position.id, position.entryPrice, subAccountId);
-          }
-        } catch (error) {
-          logger.error(`Error checking take-profit executions for position ${position.id}:`, error);
+        if ((Date.now() - startAt) > maxMs) {
+          clearInterval(timer);
+          this.breakevenWatchers.delete(key);
+          return;
         }
-      }
-    } catch (error) {
-      logger.error('Error checking take-profit executions:', error);
-    }
-  }
+        const positions = await this.bingx.getPositions(subAccountId);
+        const exchangePos = Array.isArray(positions)
+          ? positions.find((p) => p.symbol === position.symbol)
+          : null;
 
-  async startBreakEvenMonitor() {
-    // Run every 30 seconds
-    setInterval(async () => {
-      await this.checkTakeProfitExecutions();
-    }, 30000);
-    
-    logger.info('Break-even monitor started');
+        if (!exchangePos) return;
+
+        const currSize = this.roundToStepSize(Math.abs(parseFloat(exchangePos.size || 0)), stepSize);
+        if (currSize <= 0) {
+          // позиция закрыта — стоп уже не нужен
+          clearInterval(timer);
+          this.breakevenWatchers.delete(key);
+          return;
+        }
+
+        // если размер уменьшился — сработал минимум один TP
+        if (currSize < initialQty) {
+          try {
+            // отменяем старый SL и создаём новый в BE
+            if (slOrderId) {
+              await this.bingx.cancelOrder(slOrderId, position.symbol, subAccountId);
+            }
+            const beStop = {
+              symbol: position.symbol,
+              side: position.side === 'BUY' ? 'SELL' : 'BUY',
+              positionSide: position.side === 'BUY' ? 'LONG' : 'SHORT',
+              type: 'STOP_MARKET',
+              stopPrice: entryPrice.toFixed(pricePrecision),
+              workingType: 'MARK_PRICE',
+              quantity: currSize,
+              reduceOnly: true,
+              recvWindow: 5000,
+              clientOrderId: `sl_be_${Date.now()}`
+            };
+            const res = await this.bingx.placeOrder(beStop, subAccountId);
+            logger.info('Moved SL to breakeven after first TP', {
+              symbol: position.symbol, bePrice: beStop.stopPrice, newOrderId: res?.orderId
+            });
+          } catch (e) {
+            logger.error('Error moving SL to breakeven:', e);
+          } finally {
+            clearInterval(timer);
+            this.breakevenWatchers.delete(key);
+          }
+        }
+      } catch (e) {
+        logger.error('Breakeven watcher error:', e);
+      }
+    }, pollMs);
+
+    this.breakevenWatchers.set(key, timer);
   }
 
   calculateTPQuantity(totalQuantity, tpIndex, tpPercentages) {
     if (Array.isArray(tpPercentages) && tpIndex < tpPercentages.length) {
-      const p = tpPercentages[tpIndex] / 100;
-      return new Decimal(totalQuantity).times(p).toNumber();
+      const percentage = tpPercentages[tpIndex] / 100;
+      return new Decimal(totalQuantity).times(percentage).toNumber();
     }
-    const fallback = 1 / tpPercentages.length;
-    return new Decimal(totalQuantity).times(fallback).toNumber();
+    const fallbackPercentage = 1 / tpPercentages.length;
+    return new Decimal(totalQuantity).times(fallbackPercentage).toNumber();
   }
 
   async notifyExecution(signal, position, orderResult) {
@@ -815,14 +646,10 @@ class ExecutionService {
       if (customParams.leverage) signal.leverage = customParams.leverage;
 
       const executionData = {
-        signalId: signal.id,
-        channelId: signal.channelId,
-        priority: 1,
-        manual: true,
-        customParams
+        signalId: signal.id, channelId: signal.channelId, priority: 1, manual: true, customParams
       };
-
       await this.queueExecution(executionData);
+
       return { success: true, message: 'Signal queued for manual execution' };
     } catch (error) {
       logger.error('Error executing signal manually:', error);
@@ -830,27 +657,14 @@ class ExecutionService {
     }
   }
 
-  // ---------- Utils ----------
   formatSymbol(coin) {
     if (!coin) return '';
-    const raw = String(coin).trim().toUpperCase();
-
-    if (/^[A-Z0-9]+-(USDT|USDC)$/.test(raw)) return raw;
-
-    if (/^[A-Z0-9]+(USDT|USDC)$/.test(raw)) {
-      const base = raw.replace(/(USDT|USDC)$/, '');
-      const quote = raw.endsWith('USDT') ? 'USDT' : 'USDC';
-      return `${base}-${quote}`;
-    }
-
-    if (/^[A-Z0-9]+$/.test(raw)) return `${raw}-USDT`;
-
-    const clean = raw.replace(/[^A-Z0-9-]/g, '');
-    if (clean.includes('-')) {
-      const [base, quote = 'USDT'] = clean.split('-');
-      return `${base}-${quote}`.toUpperCase();
-    }
-    return `${clean}-USDT`;
+    const cleanCoin = coin.toUpperCase().replace(/[^A-Z0-9-]/g, '');
+    if (cleanCoin.endsWith('-USDT') || cleanCoin.endsWith('-USDC')) return cleanCoin;
+    if (cleanCoin.endsWith('USDT')) return `${cleanCoin.replace('USDT', '')}-USDT`;
+    if (cleanCoin.endsWith('USDC')) return `${cleanCoin.replace('USDC', '')}-USDC`;
+    if (cleanCoin.includes('USDT') && !cleanCoin.endsWith('USDT')) return `${cleanCoin.replace('USDT', '')}-USDT`;
+    return `${cleanCoin}-USDT`;
   }
 
   getOrderSide(direction) {
@@ -858,7 +672,8 @@ class ExecutionService {
   }
 
   roundToStepSize(quantity, stepSize) {
-    return Math.floor(Number(quantity) / Number(stepSize)) * Number(stepSize);
+    if (!stepSize || stepSize <= 0) return quantity;
+    return Math.floor(quantity / stepSize) * stepSize;
   }
 
   async getExecutionStats() {
@@ -870,10 +685,7 @@ class ExecutionService {
         maxConcurrentExecutions: this.maxConcurrentExecutions,
         isProcessing: this.isProcessing,
         activeExecutionDetails: Array.from(this.activeExecutions.entries()).map(([id, data]) => ({
-          executionId: id,
-          signalId: data.signalId,
-          status: data.status,
-          duration: Date.now() - data.startTime.getTime()
+          executionId: id, signalId: data.signalId, status: data.status, duration: Date.now() - data.startTime.getTime()
         }))
       };
     } catch (error) {
@@ -886,18 +698,15 @@ class ExecutionService {
     try {
       logger.info('Shutting down execution service...');
       if (this.processingInterval) clearInterval(this.processingInterval);
-
       const timeout = 30000;
       const startTime = Date.now();
-
       while (this.activeExecutions.size > 0 && (Date.now() - startTime) < timeout) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        // eslint-disable-next-line no-await-in-loop
+        await new Promise((resolve) => setTimeout(resolve, 1000));
       }
-
       if (this.activeExecutions.size > 0) {
         logger.warn(`${this.activeExecutions.size} executions still active during shutdown`);
       }
-
       this.isProcessing = false;
       logger.info('Execution service shutdown complete');
     } catch (error) {
