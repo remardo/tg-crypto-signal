@@ -226,7 +226,7 @@ class TradeExecutionService {
    * @returns {Promise<Object>} Order result
    */
   async placeMainOrder(orderParams) {
-    const { symbol, side, quantity, leverage, subAccountId, takeProfit, stopLoss } = orderParams;
+    const { symbol, side, quantity, subAccountId, takeProfit, stopLoss } = orderParams;
     
     // Format symbol to match BingX API requirements (e.g., "DYDX-USDT" instead of "DYDXUSDT")
     const formattedSymbol = this.bingx.formatSymbol(symbol);
@@ -335,21 +335,15 @@ class TradeExecutionService {
     // Round stopPrice to tick size and convert to string
     const roundedSl = this.roundToTickSize(stopPrice, symbolInfo.tickSize);
     
-    // Format stopLoss as JSON string with all values as strings
-    const stopLoss = {
-      type: 'STOP_MARKET',
-      stopPrice: roundedSl.toString(), // Convert to string
-      workingType: 'MARK_PRICE'
-    };
-
     const orderData = {
       symbol: formattedSymbol,
       side: closeSide,
       positionSide,
-      type: 'MARKET', // Use MARKET order with reduceOnly for proper execution
+      type: 'STOP_MARKET', // Changed from MARKET to STOP_MARKET
+      stopPrice: roundedSl.toString(), // Added stopPrice parameter
+      workingType: 'MARK_PRICE', // Added workingType parameter
       quantity,
       reduceOnly: true, // Critical for closing positions
-      stopLoss: JSON.stringify(stopLoss), // Clean JSON.stringify without extra spacing
       recvWindow: 5000,
       clientOrderId: `manual_sl_${Date.now()}` // Add clientOrderId for tracking
     };
@@ -398,21 +392,15 @@ class TradeExecutionService {
     // Round takeProfitPrice to tick size and convert to string
     const roundedTp = this.roundToTickSize(takeProfitPrice, symbolInfo.tickSize);
     
-    // Format takeProfit as JSON string with all values as strings
-    const takeProfit = {
-      type: 'TAKE_PROFIT_MARKET',
-      stopPrice: roundedTp.toString(), // Convert to string
-      workingType: 'MARK_PRICE'
-    };
-
     const orderData = {
       symbol: formattedSymbol,
       side: closeSide,
       positionSide,
-      type: 'MARKET', // Use MARKET order with reduceOnly for proper execution
+      type: 'TAKE_PROFIT_MARKET', // Changed from MARKET to TAKE_PROFIT_MARKET
+      stopPrice: roundedTp.toString(), // Added stopPrice parameter
+      workingType: 'MARK_PRICE', // Added workingType parameter
       quantity,
       reduceOnly: true, // Critical for closing positions
-      takeProfit: JSON.stringify(takeProfit), // Clean JSON.stringify without extra spacing
       recvWindow: 5000,
       clientOrderId: `manual_tp_${Date.now()}` // Add clientOrderId for tracking
     };

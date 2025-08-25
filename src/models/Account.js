@@ -149,6 +149,7 @@ class Account {
   }
 
   async calculatePnL() {
+    // First get closed positions data from database
     const query = `
       SELECT 
         COALESCE(SUM(CASE WHEN status = 'open' THEN unrealized_pnl ELSE 0 END), 0) as unrealized_pnl,
@@ -161,13 +162,34 @@ class Account {
     const result = await db.query(query, [this.bingxSubAccountId]);
     const data = result.rows[0];
     
-    const unrealizedPnl = parseFloat(data.unrealized_pnl);
+    // Get realized P&L and fees from database (these don't change)
     const realizedPnl = parseFloat(data.realized_pnl);
     const totalFees = parseFloat(data.total_fees);
-    const totalPnl = realizedPnl + unrealizedPnl - totalFees;
+    
+    // Get real-time unrealized P&L from exchange for open positions
+    let realtimeUnrealizedPnl = 0;
+    try {
+      // Import BingX service
+      const BingXService = require('../services/bingxService');
+      const bingx = new BingXService();
+      
+      // Get positions from exchange
+      const exchangePositions = await bingx.getPositions(this.bingxSubAccountId);
+      
+      // Sum up unrealized P&L from exchange
+      exchangePositions.forEach(pos => {
+        realtimeUnrealizedPnl += pos.unrealizedPnl;
+      });
+    } catch (error) {
+      logger.warn(`Could not get real-time P&L for account ${this.id} from exchange:`, error.message);
+      // Fallback to database value
+      realtimeUnrealizedPnl = parseFloat(data.unrealized_pnl);
+    }
+    
+    const totalPnl = realizedPnl + realtimeUnrealizedPnl - totalFees;
 
     return {
-      unrealizedPnl,
+      unrealizedPnl: realtimeUnrealizedPnl,
       realizedPnl,
       totalFees,
       totalPnl,

@@ -24,6 +24,7 @@ class ExecutionService {
       await this.bingx.initialize();
       await this.startExecutionProcessor();
       await this.subscribeToExecutionSignals();
+      await this.startBreakEvenMonitor();
       logger.info('Execution service initialized successfully');
       return true;
     } catch (error) {
@@ -528,7 +529,9 @@ class ExecutionService {
             symbol: position.symbol,
             side: position.side === 'BUY' ? 'SELL' : 'BUY',
             positionSide: position.side === 'BUY' ? 'LONG' : 'SHORT',
-            type: 'MARKET',
+            type: 'STOP_MARKET',
+            stopPrice: signal.stopLoss,
+            workingType: 'MARK_PRICE',
             quantity: position.quantity,
             reduceOnly: true,
             recvWindow: 5000,
@@ -537,7 +540,7 @@ class ExecutionService {
 
           const effectiveSub = subAccountId && subAccountId !== 'main_account' ? subAccountId : null;
           const slResult = await this.bingx.placeOrder(stopLossOrder, effectiveSub);
-          orders.push({ type: 'stop_loss', order: slResult });
+          orders.push({ type: 'stop_loss', order: slResult, orderId: slResult.orderId });
 
           logger.info('Successfully placed stop-loss order', {
             symbol: position.symbol,
@@ -594,7 +597,9 @@ class ExecutionService {
               symbol: position.symbol,
               side: position.side === 'BUY' ? 'SELL' : 'BUY',
               positionSide: position.side === 'BUY' ? 'LONG' : 'SHORT',
-              type: 'MARKET',
+              type: 'TAKE_PROFIT_MARKET',
+              stopPrice: v.price,
+              workingType: 'MARK_PRICE',
               quantity: v.quantity,
               reduceOnly: true,
               recvWindow: 5000,
@@ -603,7 +608,7 @@ class ExecutionService {
 
             const effectiveSub = subAccountId && subAccountId !== 'main_account' ? subAccountId : null;
             const tpResult = await this.bingx.placeOrder(tpOrder, effectiveSub);
-            orders.push({ type: `take_profit_${v.index}`, order: tpResult });
+            orders.push({ type: `take_profit_${v.index}`, order: tpResult, orderId: tpResult.orderId });
 
             logger.info(`Successfully placed TP${v.index} order`, {
               quantity: v.quantity,
@@ -637,11 +642,144 @@ class ExecutionService {
         }
       }
 
+      // Store order information for break-even functionality
+      if (orders.length > 0) {
+        await this.storePositionOrders(position.id, orders);
+      }
+
       return orders;
     } catch (error) {
       logger.error('Error placing risk management orders:', error);
       return [];
     }
+  }
+
+  async storePositionOrders(positionId, orders) {
+    try {
+      // Store order information in Redis for later retrieval
+      const orderData = {
+        positionId,
+        orders,
+        createdAt: new Date().toISOString()
+      };
+      await redisUtils.set(`position_orders:${positionId}`, JSON.stringify(orderData));
+      logger.info('Stored position orders for break-even tracking', { positionId });
+    } catch (error) {
+      logger.error('Error storing position orders:', error);
+    }
+  }
+
+  async moveStopLossToBreakEven(positionId, entryPrice, subAccountId) {
+    try {
+      // Retrieve stored order information
+      const orderDataStr = await redisUtils.get(`position_orders:${positionId}`);
+      if (!orderDataStr) {
+        logger.warn('No order data found for position', { positionId });
+        return;
+      }
+
+      const orderData = JSON.parse(orderDataStr);
+      const stopLossOrder = orderData.orders.find(order => order.type === 'stop_loss');
+      
+      if (!stopLossOrder) {
+        logger.warn('No stop-loss order found for position', { positionId });
+        return;
+      }
+
+      // Cancel existing stop-loss order
+      try {
+        await this.bingx.cancelOrder(stopLossOrder.orderId, orderData.orders[0].order.symbol, subAccountId);
+        logger.info('Cancelled old stop-loss order', { orderId: stopLossOrder.orderId });
+      } catch (error) {
+        logger.error('Error cancelling stop-loss order:', error);
+        return;
+      }
+
+      // Place new stop-loss order at break-even (entry price)
+      const newStopLossOrder = {
+        symbol: orderData.orders[0].order.symbol,
+        side: stopLossOrder.order.side,
+        positionSide: stopLossOrder.order.positionSide,
+        type: 'STOP_MARKET',
+        stopPrice: entryPrice.toString(),
+        workingType: 'MARK_PRICE',
+        quantity: stopLossOrder.order.quantity,
+        reduceOnly: true,
+        recvWindow: 5000,
+        clientOrderId: `breakeven_${Date.now()}`
+      };
+
+      const effectiveSub = subAccountId && subAccountId !== 'main_account' ? subAccountId : null;
+      const result = await this.bingx.placeOrder(newStopLossOrder, effectiveSub);
+      
+      logger.info('Moved stop-loss to break-even', {
+        positionId,
+        entryPrice,
+        newOrderId: result.orderId
+      });
+
+      // Update stored order information
+      const updatedOrders = orderData.orders.map(order => 
+        order.type === 'stop_loss' ? { ...order, orderId: result.orderId } : order
+      );
+      
+      await this.storePositionOrders(positionId, updatedOrders);
+    } catch (error) {
+      logger.error('Error moving stop-loss to break-even:', error);
+    }
+  }
+
+  async checkTakeProfitExecutions() {
+    try {
+      // Get all open positions
+      const openPositions = await Position.getOpenPositions();
+      
+      for (const position of openPositions) {
+        try {
+          // Get stored order information for this position
+          const orderDataStr = await redisUtils.get(`position_orders:${position.id}`);
+          if (!orderDataStr) continue;
+          
+          const orderData = JSON.parse(orderDataStr);
+          const takeProfitOrders = orderData.orders.filter(order => order.type.startsWith('take_profit'));
+          
+          if (takeProfitOrders.length === 0) continue;
+          
+          // Get account info to determine sub-account
+          const account = await Account.findByChannelId(position.channelId);
+          const subAccountId = account ? account.bingxSubAccountId || null : null;
+          
+          // Check if any take-profit orders have been filled
+          const openOrders = await this.bingx.getOpenOrders(position.symbol, subAccountId);
+          const filledTpOrders = takeProfitOrders.filter(tpOrder => 
+            !openOrders.some(openOrder => openOrder.orderId === tpOrder.orderId)
+          );
+          
+          if (filledTpOrders.length > 0) {
+            logger.info('Take-profit order(s) filled, moving stop-loss to break-even', {
+              positionId: position.id,
+              filledOrders: filledTpOrders.map(o => o.orderId)
+            });
+            
+            // Move stop-loss to break-even
+            await this.moveStopLossToBreakEven(position.id, position.entryPrice, subAccountId);
+          }
+        } catch (error) {
+          logger.error(`Error checking take-profit executions for position ${position.id}:`, error);
+        }
+      }
+    } catch (error) {
+      logger.error('Error checking take-profit executions:', error);
+    }
+  }
+
+  async startBreakEvenMonitor() {
+    // Run every 30 seconds
+    setInterval(async () => {
+      await this.checkTakeProfitExecutions();
+    }, 30000);
+    
+    logger.info('Break-even monitor started');
   }
 
   calculateTPQuantity(totalQuantity, tpIndex, tpPercentages) {

@@ -135,7 +135,27 @@ class PositionService {
 
   async updatePositionPrice(position, currentPrice) {
     try {
-      // Calculate new unrealized P&L
+      // Get account for this position
+      const account = await Account.findByChannelId(position.channelId);
+      if (account) {
+        // Get positions from exchange
+        const exchangePositions = await this.bingx.getPositions(account.bingxSubAccountId);
+        const exchangePosition = exchangePositions.find(p => p.symbol === position.symbol);
+        
+        if (exchangePosition) {
+          // Update position with real-time data from exchange
+          await position.syncFromExchange(exchangePosition);
+          
+          // Check for take profit or stop loss triggers using exchange data
+          await this.checkExitConditions(position, exchangePosition.markPrice);
+          
+          // Cache updated position
+          await this.cachePosition(position);
+          return;
+        }
+      }
+      
+      // Fallback to local calculation if exchange data is not available
       const unrealizedPnl = position.calculateUnrealizedPnl(currentPrice);
       
       // Update position with new price and P&L
@@ -625,10 +645,8 @@ class PositionService {
               const exchangePosition = exchangePositions.find(p => p.symbol === position.symbol);
               
               if (exchangePosition) {
-                // Update position with real-time data from exchange
-                position.currentPrice = exchangePosition.markPrice;
-                position.unrealizedPnl = exchangePosition.unrealizedPnl;
-                position.quantity = exchangePosition.size;
+                // Update position with real-time data from exchange using the new method
+                await position.syncFromExchange(exchangePosition);
               }
             }
           } catch (error) {
@@ -694,7 +712,7 @@ class PositionService {
               currentPnl = exchangePosition.unrealizedPnl;
               
               // Update position in database with real-time data
-              await position.updatePrice(currentPrice);
+              await position.syncFromExchange(exchangePosition);
             }
           }
         } catch (error) {
@@ -758,8 +776,8 @@ class PositionService {
               currentPrice = exchangePosition.markPrice;
               currentPnl = exchangePosition.unrealizedPnl;
               
-              // Update position in database with real-time data
-              await position.updatePrice(currentPrice);
+              // Update position in database with real-time data using the new method
+              await position.syncFromExchange(exchangePosition);
             }
           }
         } catch (error) {
@@ -818,8 +836,7 @@ class PositionService {
               
               if (exchangePosition) {
                 // Update position with real-time data from exchange
-                position.currentPrice = exchangePosition.markPrice;
-                position.unrealizedPnl = exchangePosition.unrealizedPnl;
+                await position.syncFromExchange(exchangePosition);
               }
             }
           } catch (error) {
@@ -828,10 +845,7 @@ class PositionService {
         }
       }
       
-      return positions.map(p => ({
-        ...p,
-        currentPnl: p.unrealizedPnl || this.calculateCurrentPnl(p)
-      }));
+      return positions.map(p => p.toJSON());
 
     } catch (error) {
       logger.error('Error getting positions by channel:', error);
@@ -1829,13 +1843,48 @@ class PositionService {
       // Get all open positions from database
       const openPositions = await Position.getOpenPositions();
       
+      if (openPositions.length === 0) {
+        logger.info('No open positions to sync');
+        return;
+      }
+      
+      // Group positions by sub-account
+      const subAccountPositions = {};
+      for (const position of openPositions) {
+        const account = await Account.findByChannelId(position.channelId);
+        if (account && account.bingxSubAccountId) {
+          if (!subAccountPositions[account.bingxSubAccountId]) {
+            subAccountPositions[account.bingxSubAccountId] = [];
+          }
+          subAccountPositions[account.bingxSubAccountId].push(position);
+        }
+      }
+      
       let syncedCount = 0;
       
-      // Sync each position
-      for (const position of openPositions) {
-        const wasSynced = await position.syncWithExchange(this.bingx);
-        if (wasSynced) {
-          syncedCount++;
+      // Sync positions for each sub-account
+      for (const [subAccountId, positions] of Object.entries(subAccountPositions)) {
+        try {
+          // Get all positions from exchange for this sub-account
+          const exchangePositions = await this.bingx.getPositions(subAccountId);
+          
+          // Sync each position
+          for (const position of positions) {
+            const exchangePosition = exchangePositions.find(p => p.symbol === position.symbol);
+            if (exchangePosition) {
+              await position.syncFromExchange(exchangePosition);
+              syncedCount++;
+            } else {
+              // If position doesn't exist on exchange but is open in DB, close it
+              if (position.status === 'open') {
+                logger.info(`Position ${position.id} not found on exchange, marking as closed`);
+                await position.close(position.currentPrice || position.entryPrice, 0, 0);
+                syncedCount++;
+              }
+            }
+          }
+        } catch (error) {
+          logger.error(`Error syncing positions for sub-account ${subAccountId}:`, error);
         }
       }
       

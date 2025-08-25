@@ -378,6 +378,21 @@ class Position {
     }
   }
 
+  /**
+   * Sync position data from exchange
+   * @param {Object} exchangePosition - Position data from exchange
+   * @returns {Promise<void>}
+   */
+  async syncFromExchange(exchangePosition) {
+    const updateData = {
+      currentPrice: parseFloat(exchangePosition.markPrice),
+      unrealizedPnl: parseFloat(exchangePosition.unrealizedPnl),
+      quantity: parseFloat(exchangePosition.size),
+      leverage: parseInt(exchangePosition.leverage)
+    };
+    await this.update(updateData);
+  }
+
   toJSON() {
     return {
       id: this.id,
