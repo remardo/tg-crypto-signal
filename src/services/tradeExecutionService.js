@@ -65,17 +65,21 @@ class TradeExecutionService {
       let stopLossParam = null;
       
       if (riskManagement.takeProfit) {
+        // Round to tick size and convert to string
+        const roundedTp = this.roundToTickSize(riskManagement.takeProfit, symbolInfo.tickSize || 0.0001);
         takeProfitParam = {
           type: 'TAKE_PROFIT_MARKET',
-          stopPrice: riskManagement.takeProfit.toString(),
+          stopPrice: roundedTp.toString(),
           workingType: 'MARK_PRICE'
         };
       }
       
       if (riskManagement.stopLoss) {
+        // Round to tick size and convert to string
+        const roundedSl = this.roundToTickSize(riskManagement.stopLoss, symbolInfo.tickSize || 0.0001);
         stopLossParam = {
           type: 'STOP_MARKET',
-          stopPrice: riskManagement.stopLoss.toString(),
+          stopPrice: roundedSl.toString(),
           workingType: 'MARK_PRICE'
         };
       }
@@ -85,10 +89,10 @@ class TradeExecutionService {
         symbol,
         side,
         quantity: adjustedQuantity,
-        leverage,
         subAccountId,
         takeProfit: takeProfitParam,
         stopLoss: stopLossParam
+        // Removed leverage parameter - it should be set separately via setLeverage
       });
 
       // 7. Create position record
@@ -182,6 +186,18 @@ class TradeExecutionService {
   }
 
   /**
+   * Helper function to round price to tick size
+   * @param {number} price - Price to round
+   * @param {number} tickSize - Tick size for the symbol
+   * @returns {number} Rounded price
+   */
+  roundToTickSize(price, tickSize) {
+    const tick = Number(tickSize);
+    if (!isFinite(tick) || tick <= 0) return Number(price);
+    return Math.floor(Number(price) / tick) * tick;
+  }
+
+  /**
    * Set leverage for a symbol
    * @param {string} symbol - Trading pair
    * @param {number} leverage - Leverage to set
@@ -215,33 +231,58 @@ class TradeExecutionService {
     // Format symbol to match BingX API requirements (e.g., "DYDX-USDT" instead of "DYDXUSDT")
     const formattedSymbol = this.bingx.formatSymbol(symbol);
     
+    // Get symbol info for tick size
+    let symbolInfo;
+    try {
+      symbolInfo = await this.bingx.getSymbolInfo(formattedSymbol);
+    } catch (error) {
+      logger.warn(`Could not get symbol info for ${formattedSymbol}, using defaults`, { error: error.message });
+      symbolInfo = {
+        tickSize: 0.0001,
+        stepSize: 0.001
+      };
+    }
+    
     const orderData = {
       symbol: formattedSymbol,
       side,
       type: 'MARKET',
       quantity,
-      ...(leverage && { leverage }),
-      reduceOnly: false,
-      recvWindow: 5000
+      recvWindow: 5000,
+      clientOrderId: `manual_${Date.now()}` // Add clientOrderId for tracking
+      // Removed leverage parameter - it should be set separately via setLeverage
+      // Removed reduceOnly: false - not needed for entry orders
     };
 
-    // Add takeProfit parameter if provided, formatted as JSON string
+    // Add takeProfit parameter if provided, formatted as clean JSON string
     if (takeProfit) {
       if (typeof takeProfit === 'string') {
         orderData.takeProfit = takeProfit;
       } else {
-        // Format as JSON string matching API example format
-        orderData.takeProfit = JSON.stringify(takeProfit).replace(/:/g, ': ').replace(/,/g, ', ');
+        // Round stopPrice to tick size and convert to string
+        const roundedTp = this.roundToTickSize(takeProfit.stopPrice, symbolInfo.tickSize);
+        const tpWithRoundedPrice = {
+          ...takeProfit,
+          stopPrice: roundedTp.toString()
+        };
+        // Use clean JSON.stringify without extra spacing
+        orderData.takeProfit = JSON.stringify(tpWithRoundedPrice);
       }
     }
 
-    // Add stopLoss parameter if provided, formatted as JSON string
+    // Add stopLoss parameter if provided, formatted as clean JSON string
     if (stopLoss) {
       if (typeof stopLoss === 'string') {
         orderData.stopLoss = stopLoss;
       } else {
-        // Format as JSON string matching API example format
-        orderData.stopLoss = JSON.stringify(stopLoss).replace(/:/g, ': ').replace(/,/g, ', ');
+        // Round stopPrice to tick size and convert to string
+        const roundedSl = this.roundToTickSize(stopLoss.stopPrice, symbolInfo.tickSize);
+        const slWithRoundedPrice = {
+          ...stopLoss,
+          stopPrice: roundedSl.toString()
+        };
+        // Use clean JSON.stringify without extra spacing
+        orderData.stopLoss = JSON.stringify(slWithRoundedPrice);
       }
     }
 
@@ -279,10 +320,25 @@ class TradeExecutionService {
     const closeSide = side === 'BUY' ? 'SELL' : 'BUY';
     const positionSide = side === 'BUY' ? 'LONG' : 'SHORT';
 
-    // Format stopLoss as JSON string with all values as strings to match API example
+    // Get symbol info for tick size
+    let symbolInfo;
+    try {
+      symbolInfo = await this.bingx.getSymbolInfo(formattedSymbol);
+    } catch (error) {
+      logger.warn(`Could not get symbol info for ${formattedSymbol}, using defaults`, { error: error.message });
+      symbolInfo = {
+        tickSize: 0.0001,
+        stepSize: 0.001
+      };
+    }
+    
+    // Round stopPrice to tick size and convert to string
+    const roundedSl = this.roundToTickSize(stopPrice, symbolInfo.tickSize);
+    
+    // Format stopLoss as JSON string with all values as strings
     const stopLoss = {
       type: 'STOP_MARKET',
-      stopPrice: stopPrice.toString(), // Convert to string
+      stopPrice: roundedSl.toString(), // Convert to string
       workingType: 'MARK_PRICE'
     };
 
@@ -293,8 +349,9 @@ class TradeExecutionService {
       type: 'MARKET', // Use MARKET order with reduceOnly for proper execution
       quantity,
       reduceOnly: true, // Critical for closing positions
-      stopLoss: JSON.stringify(stopLoss).replace(/:/g, ': ').replace(/,/g, ', '),
-      recvWindow: 5000
+      stopLoss: JSON.stringify(stopLoss), // Clean JSON.stringify without extra spacing
+      recvWindow: 5000,
+      clientOrderId: `manual_sl_${Date.now()}` // Add clientOrderId for tracking
     };
 
     try {
@@ -305,7 +362,7 @@ class TradeExecutionService {
         side: closeSide,
         positionSide,
         quantity,
-        stopPrice,
+        stopPrice: roundedSl,
         orderId: result.orderId
       });
 
@@ -316,11 +373,6 @@ class TradeExecutionService {
     }
   }
 
-  /**
-   * Place take profit order
-   * @param {Object} tpParams - Take profit parameters
-   * @returns {Promise<Object>} Order result
-   */
   async placeTakeProfitOrder(tpParams) {
     const { symbol, side, quantity, takeProfitPrice, subAccountId } = tpParams;
     
@@ -331,10 +383,25 @@ class TradeExecutionService {
     const closeSide = side === 'BUY' ? 'SELL' : 'BUY';
     const positionSide = side === 'BUY' ? 'LONG' : 'SHORT';
 
-    // Format takeProfit as JSON string with all values as strings to match API example
+    // Get symbol info for tick size
+    let symbolInfo;
+    try {
+      symbolInfo = await this.bingx.getSymbolInfo(formattedSymbol);
+    } catch (error) {
+      logger.warn(`Could not get symbol info for ${formattedSymbol}, using defaults`, { error: error.message });
+      symbolInfo = {
+        tickSize: 0.0001,
+        stepSize: 0.001
+      };
+    }
+    
+    // Round takeProfitPrice to tick size and convert to string
+    const roundedTp = this.roundToTickSize(takeProfitPrice, symbolInfo.tickSize);
+    
+    // Format takeProfit as JSON string with all values as strings
     const takeProfit = {
       type: 'TAKE_PROFIT_MARKET',
-      stopPrice: takeProfitPrice.toString(), // Convert to string
+      stopPrice: roundedTp.toString(), // Convert to string
       workingType: 'MARK_PRICE'
     };
 
@@ -345,8 +412,9 @@ class TradeExecutionService {
       type: 'MARKET', // Use MARKET order with reduceOnly for proper execution
       quantity,
       reduceOnly: true, // Critical for closing positions
-      takeProfit: JSON.stringify(takeProfit).replace(/:/g, ': ').replace(/,/g, ', '),
-      recvWindow: 5000
+      takeProfit: JSON.stringify(takeProfit), // Clean JSON.stringify without extra spacing
+      recvWindow: 5000,
+      clientOrderId: `manual_tp_${Date.now()}` // Add clientOrderId for tracking
     };
 
     try {
@@ -357,7 +425,7 @@ class TradeExecutionService {
         side: closeSide,
         positionSide,
         quantity,
-        takeProfitPrice,
+        takeProfitPrice: roundedTp,
         orderId: result.orderId
       });
 
