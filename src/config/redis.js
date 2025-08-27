@@ -211,12 +211,17 @@ const redisUtils = {
   },
 
   // Pub/Sub operations
+  // Безопасный publish: принимает строку или объект
   async publish(channel, message) {
     try {
-      const serializedMessage = JSON.stringify(message);
-      return await redisClient.publish(channel, serializedMessage);
+      if (typeof channel !== 'string' || !channel.length) {
+        throw new Error(`publish: channel must be string, got ${typeof channel}`);
+      }
+      const payload = (typeof message === 'string') ? message : JSON.stringify(message ?? {});
+      return await redisClient.publish(channel, payload);
     } catch (error) {
-      logger.error('Redis PUBLISH error:', error);
+      // логируйте канал и тип данных, чтобы быстро ловить регресс
+      logger.error('Redis publish failed', { channel, typeofData: typeof message, err: error?.message });
       return 0;
     }
   },
@@ -341,7 +346,9 @@ const CHANNELS = {
   POSITION_CLOSED: 'position:closed',
   ACCOUNT_UPDATE: 'account:update',
   PRICE_UPDATE: 'price:update',
-  CHANNEL_UPDATE: 'channel:update'
+  CHANNEL_UPDATE: 'channel:update',
+  POSITION_PNL_UPDATED: 'position:pnl_updated',
+  POSITION_PRICE_UPDATED: 'position:price_updated'
 };
 
 module.exports = {

@@ -370,37 +370,8 @@ class ExecutionService {
         clientOrderId: `sig_${Date.now()}`
       };
 
-      // TP1
-      if (signal.takeProfitLevels && signal.takeProfitLevels.length > 0) {
-        const tp1 = parseFloat(signal.takeProfitLevels[0]);
-        const ok = (signal.direction === 'LONG' && tp1 > currentPrice) || (signal.direction === 'SHORT' && tp1 < currentPrice);
-        if (ok) {
-          orderData.takeProfit = JSON.stringify({
-            type: 'TAKE_PROFIT_MARKET',
-            stopPrice: tp1.toFixed(pricePrecision),
-            workingType: 'MARK_PRICE'
-          });
-          logger.info(`Added take profit to main order at ${tp1} (current: ${currentPrice})`, { symbol });
-        } else {
-          logger.warn('Skipping TP1 for main order - invalid level vs current price', { symbol, tp1, currentPrice });
-        }
-      }
-
-      // SL
-      if (signal.stopLoss) {
-        const sl = parseFloat(signal.stopLoss);
-        const ok = (signal.direction === 'LONG' && sl < currentPrice) || (signal.direction === 'SHORT' && sl > currentPrice);
-        if (ok) {
-          orderData.stopLoss = JSON.stringify({
-            type: 'STOP_MARKET',
-            stopPrice: sl.toFixed(pricePrecision),
-            workingType: 'MARK_PRICE'
-          });
-          logger.info(`Added stop loss to main order at ${sl} (current: ${currentPrice})`, { symbol });
-        } else {
-          logger.warn('Skipping SL for main order - invalid level vs current price', { symbol, sl, currentPrice });
-        }
-      }
+      // Remove TP1 and SL from main order - they will be placed as separate orders
+      // This ensures clean separation: 1 main order + 1 SL + 3 TPs
 
       const result = await this.bingx.placeOrder(orderData, subAccountId);
       return result;
@@ -473,18 +444,18 @@ class ExecutionService {
         }
       }
 
-      // ---- TAKE PROFITS (TP2..n) ----
+      // ---- TAKE PROFITS (TP1, TP2, TP3) ----
       const tpPercentages = channel.tpPercentages || [25.0, 25.0, 50.0];
       const levels = Array.isArray(signal.takeProfitLevels) ? signal.takeProfitLevels : [];
       const sortedTp = [...levels].map(x => (typeof x === 'object' ? parseFloat(x.price) : parseFloat(x)))
         .filter((v) => Number.isFinite(v))
         .sort((a, b) => (position.side === 'BUY' ? a - b : b - a));
 
-      // распределяем количества
+      // распределяем количества по всем TP уровням (TP1, TP2, TP3)
       const originalQty = this.roundToStepSize(position.quantity, stepSize);
       let remainingQty = originalQty;
 
-      for (let i = 1; i < sortedTp.length; i += 1) { // с TP2
+      for (let i = 0; i < sortedTp.length && i < tpPercentages.length; i += 1) { // с TP1
         const tpPrice = sortedTp[i];
         let tpQty = this.calculateTPQuantity(originalQty, i, tpPercentages);
 

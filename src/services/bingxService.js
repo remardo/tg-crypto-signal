@@ -1,8 +1,23 @@
-// src/services/bingxService.js
 const axios = require('axios');
 const crypto = require('crypto');
 const config = require('../config/app');
 const { logger, trade: tradeLog } = require('../utils/logger');
+
+// --- RFC3986-safe urlencode (BingX чувствителен к строке подписи) ---
+const encodeRFC3986 = (str) =>
+  encodeURIComponent(str).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+
+function buildQueryString(params = {}) {
+  // убрать пустые значения (кроме '0') и отсортировать
+  const compact = {};
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === null) continue;
+    if (typeof v === 'string' && v.length === 0) continue;
+    compact[k] = v;
+  }
+  const keys = Object.keys(compact).sort();
+  return keys.map((k) => `${encodeRFC3986(k)}=${encodeRFC3986(String(compact[k]))}`).join('&');
+}
 
 class BingXService {
   constructor() {
@@ -10,6 +25,7 @@ class BingXService {
     this.secretKey = config.bingx.secretKey;
     this.baseUrl = config.bingx.baseUrl;
     this.initialized = false;
+  this.mode = 'mock'; // 'real' when credentials validated
 
     this.supportedSymbols = [];
     this.symbolCacheExpiry = 24 * 60 * 60 * 1000; // 24h
@@ -17,18 +33,6 @@ class BingXService {
   }
 
   /* -------------------------------- Helpers -------------------------------- */
-
-  // Strict RFC3986 encoding for query params (matches signature + transport)
-  encodeRFC3986(value) {
-    return encodeURIComponent(String(value))
-      .replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16));
-  }
-
-  // Build sorted query string with RFC3986 encoding
-  buildQuery(params) {
-    const keys = Object.keys(params).sort();
-    return keys.map((k) => `${k}=${this.encodeRFC3986(params[k])}`).join('&');
-  }
 
   // HMAC-SHA256 signature
   generateSignature(queryString, secret) {
@@ -49,7 +53,8 @@ class BingXService {
     try {
       if (!this.apiKey || !this.secretKey) {
         logger.warn('BingX API credentials not provided - using mock mode');
-        this.initialized = true;
+  this.initialized = true;
+  this.mode = 'mock';
         return true;
       }
 
@@ -57,6 +62,7 @@ class BingXService {
       const accountInfo = await this.getAccountInfo();
       if (accountInfo) {
         this.initialized = true;
+  this.mode = 'real';
         logger.info('BingX service initialized successfully - REAL TRADING MODE ENABLED', {
           balance: accountInfo.balance,
           availableBalance: accountInfo.availableBalance,
@@ -70,7 +76,8 @@ class BingXService {
     } catch (error) {
       logger.error('Failed to initialize BingX service:', error);
       logger.warn('Falling back to mock mode due to initialization error');
-      this.initialized = true;
+  this.initialized = true;
+  this.mode = 'mock';
       return true;
     }
   }
@@ -122,83 +129,54 @@ class BingXService {
    */
   async makeRequest(method, endpoint, params = {}, isAuth = true) {
     try {
-      const url = `${this.baseUrl}${endpoint}`;
-
-      const headers = {
-        'User-Agent': 'TG-Crypto-Signal/1.0',
-        Accept: 'application/json',
-      };
-
-      let paramsToSend = { ...params };
+      const urlBase = `${this.baseUrl}${endpoint}`;
+      const headers = { 'User-Agent': 'TG-Crypto-Signal/1.0' };
+      let finalUrl = urlBase;
+      let body; // тело пустое для совместимости с BingX (все параметры — в query)
 
       if (isAuth) {
-        paramsToSend.timestamp = Date.now();
-
-        // Signature is computed on the sorted+encoded query WITHOUT signature
-        const qsForSign = this.buildQuery(paramsToSend);
-        const signature = this.generateSignature(qsForSign, this.secretKey);
-        paramsToSend.signature = signature;
-
+        const payload = { ...params, timestamp: Date.now() };
+        const qs = buildQueryString(payload);
+        const signature = this.generateSignature(qs, this.secretKey);
+        finalUrl = `${urlBase}?${qs}&signature=${signature}`;
         headers['X-BX-APIKEY'] = this.apiKey;
-      }
-
-      const requestConfig = {
-        method,
-        url,
-        timeout: config.bingx.timeout,
-        headers,
-        // always push parameters via query string
-        params: paramsToSend,
-        // axios must serialize params EXACTLY like buildQuery (to match signature)
-        paramsSerializer: {
-          serialize: (p) => this.buildQuery(p),
-        },
-      };
-
-      // For POST/DELETE BingX still expects query params; body can be empty
-      if (method === 'POST' || method === 'DELETE') {
-        requestConfig.headers['Content-Type'] = 'application/x-www-form-urlencoded';
-        requestConfig.data = ''; // keep body empty
+      } else {
+        const qs = buildQueryString(params);
+        finalUrl = qs ? `${urlBase}?${qs}` : urlBase;
       }
 
       logger.debug('BingX API Request:', {
         method,
         endpoint,
-        url,
-        params: isAuth ? { ...paramsToSend, signature: '[HIDDEN]' } : paramsToSend,
+        url: finalUrl.replace(/signature=[^&]+/, 'signature=[HIDDEN]')
       });
 
-      const response = await axios(requestConfig);
-
-      logger.debug('BingX API Response:', {
-        status: response.status,
-        data: response.data,
+      const response = await axios({
+        method,
+        url: finalUrl,
+        headers,
+        timeout: config.bingx.timeout,
+        data: body
       });
 
-      const data = response.data;
-      if (data && data.code && data.code !== 0 && data.code !== '0') {
-        throw new Error(
-          `BingX API Error [${data.code}]: ${data.msg || 'Unknown error'}`
-        );
+      logger.debug('BingX API Response:', { status: response.status, data: response.data });
+
+      if (response.data.code && response.data.code !== 0 && response.data.code !== '0') {
+        throw new Error(`BingX API Error [${response.data.code}]: ${response.data.msg || 'Unknown error'}`);
       }
-
-      return data.data || data;
+      return response.data.data || response.data;
     } catch (error) {
       if (error.response) {
         logger.error(`BingX API request failed: ${method} ${endpoint}`, {
           status: error.response.status,
           statusText: error.response.statusText,
-          data: error.response.data,
-          params,
+          data: error.response.data
         });
         if (error.response.data && error.response.data.msg) {
           throw new Error(`BingX API Error: ${error.response.data.msg}`);
         }
       } else {
-        logger.error(`BingX API request failed: ${method} ${endpoint}`, {
-          error: error.message,
-          params,
-        });
+        logger.error(`BingX API request failed: ${method} ${endpoint}`, { error: error.message });
       }
       throw error;
     }
@@ -281,7 +259,10 @@ class BingXService {
     try {
       const endpoint = config.bingx.endpoints.positions;
       const params = {};
-      if (subAccountId) params.subAccountId = subAccountId;
+      // НЕ слать "main_account" — для мейн-аккаунта параметр вообще не нужен
+      if (subAccountId && subAccountId !== 'main' && subAccountId !== 'main_account') {
+        params.subAccountId = subAccountId;
+      }
 
       const result = await this.makeRequest('GET', endpoint, params);
 
@@ -800,86 +781,58 @@ class BingXService {
       const priceRisk = Math.abs(entryPrice - stopLoss);
       if (priceRisk === 0) return 0;
 
-      const baseQuantity = riskAmount / priceRisk;
-      const leveragedQuantity = baseQuantity * leverage;
+      const positionValue = riskAmount * leverage;
+      const quantity = positionValue / entryPrice;
 
-      return leveragedQuantity;
+      return quantity;
     } catch (error) {
       logger.error('Error calculating position size:', error);
       return 0;
     }
   }
 
-  validateOrder(orderData, accountInfo, symbolInfo) {
-    const errors = [];
+  /* ---------------------------- Symbol Formatting -------------------------- */
 
-    if (orderData.quantity < symbolInfo.minQty) {
-      errors.push(`Quantity ${orderData.quantity} is below minimum ${symbolInfo.minQty}`);
-    }
-
-    if (orderData.quantity > symbolInfo.maxQty) {
-      errors.push(`Quantity ${orderData.quantity} exceeds maximum ${symbolInfo.maxQty}`);
-    }
-
-    const requiredMargin =
-      (Number(orderData.quantity) * Number(orderData.price || 0)) / (Number(orderData.leverage || 1) || 1);
-
-    if (requiredMargin > accountInfo.availableBalance) {
-      errors.push(
-        `Insufficient balance. Required: ${requiredMargin}, Available: ${accountInfo.availableBalance}`
-      );
-    }
-
-    if (orderData.leverage && orderData.leverage > symbolInfo.maxLeverage) {
-      errors.push(`Leverage ${orderData.leverage} exceeds maximum ${symbolInfo.maxLeverage}`);
-    }
-
-    return { isValid: errors.length === 0, errors };
-  }
-
-  getStatus() {
-    return {
-      initialized: this.initialized,
-      baseUrl: this.baseUrl,
-      hasCredentials: !!(this.apiKey && this.secretKey),
-    };
-  }
-
-  /* ------------------------------- Utilities -------------------------------- */
-
-  /**
-   * Format symbols robustly:
-   *  - keep "BASE-USDT" as-is (uppercased)
-   *  - "BASEUSDT" -> "BASE-USDT"
-   *  - "wif-usdt" / "WIFUSDT" / "WIF" -> normalized to "WIF-USDT"
-   */
   formatSymbol(symbol) {
     if (!symbol) return '';
-
-    const raw = String(symbol).trim().toUpperCase();
-
-    // already like BASE-USDT / BASE-USDC
-    if (/^[A-Z0-9]+-(USDT|USDC)$/.test(raw)) return raw;
-
-    // no dash, ends with USDT/USDC
-    if (/^[A-Z0-9]+(USDT|USDC)$/.test(raw)) {
-      const base = raw.replace(/(USDT|USDC)$/, '');
-      const quote = raw.endsWith('USDT') ? 'USDT' : 'USDC';
+    
+    // If already in correct format (e.g. "BTC-USDT"), return as is
+    if (symbol.includes('-') && (symbol.endsWith('USDT') || symbol.endsWith('USDC'))) {
+      return symbol;
+    }
+    
+    // If in format "BTCUSDT", convert to "BTC-USDT"
+    if (symbol.endsWith('USDT') || symbol.endsWith('USDC')) {
+      const base = symbol.slice(0, -4);
+      const quote = symbol.slice(-4);
       return `${base}-${quote}`;
     }
-
-    // simple base -> assume USDT
-    if (/^[A-Z0-9]+$/.test(raw)) {
-      return `${raw}-USDT`;
+    
+    // If just base asset (e.g. "BTC"), assume USDT quote
+    if (!symbol.includes('-')) {
+      return `${symbol}-USDT`;
     }
+    
+    return symbol;
+  }
 
-    // fallback: strip non-allowed, rebuild
-    const clean = raw.replace(/[^A-Z0-9-]/g, '');
-    if (clean.includes('-')) {
-      const [base, quote = 'USDT'] = clean.split('-');
-      return `${base}-${quote}`.toUpperCase();
+  /* ------------------------------- Status ---------------------------------- */
+
+  getStatus() {
+    try {
+      const hasCredentials = Boolean(this.apiKey && this.secretKey);
+      return {
+        initialized: !!this.initialized,
+        hasCredentials,
+        mode: this.mode,
+        baseUrl: this.baseUrl,
+        supportedSymbolsCount: Array.isArray(this.supportedSymbols) ? this.supportedSymbols.length : 0,
+        lastSymbolCacheUpdate: this.lastSymbolCacheUpdate || 0,
+        status: this.initialized ? 'running' : 'not_initialized'
+      };
+    } catch (e) {
+      return { initialized: false, hasCredentials: false, mode: 'mock', status: 'error', error: e.message };
     }
-    return `${clean}-USDT`;
   }
 }
 

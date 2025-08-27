@@ -1,0 +1,104 @@
+diff --git a/src/models/Position.js b/src/models/Position.js
+--- a/src/models/Position.js
++++ b/src/models/Position.js
+@@
+-const { logger } = require('../utils/logger');
+-const BingXService = require('../services/bingxService');
+-// ⚠️ Модель не должна напрямую ходить на биржу. Это вызывало:
+-// "bingxService.getPositions is not a function"
+-const bingxService = new BingXService();
++const { logger } = require('../utils/logger');
+@@
+ class Position {
+   constructor(row) {
+     Object.assign(this, row);
+   }
+@@
+   async update(data) {
+     const row = await Position._dbUpdate(this.id, data);
+     Object.assign(this, row);
+     return this;
+   }
+ 
+-  /**
+-   * ⚠️ Старый вариант: модель сама ходила на биржу и пыталась сверяться с позициями,
+-   * что ломалось (bingxService.getPositions is not a function) и нарушает слой ответственности.
+-   * Удаляем сетевые вызовы из модели.
+-   */
+-  async syncWithExchange(opts = {}) {
+-    try {
+-      // Ранее здесь был вызов bingxService.getPositions(...)
+-      // Убираем любые обращения к сервисам из модели.
+-      if (opts && opts.existsOnExchange === false) {
+-        if (this.status !== 'CLOSED') {
+-          await this.update({ status: 'CLOSED' });
+-        }
+-      }
+-      return this;
+-    } catch (e) {
+-      logger.error('Error syncing position with exchange:', e);
+-      return this;
+-    }
+-  }
++  /**
++   * «Мягкий» синк: модель ничего не запрашивает.
++   * Если сервис сообщил, что позиции на бирже больше нет — закрываем локально.
++   */
++  async syncWithExchange(opts = {}) {
++    try {
++      if (opts && opts.existsOnExchange === false) {
++        if (this.status !== 'CLOSED') {
++          await this.update({ status: 'CLOSED' });
++        }
++      }
++      return this;
++    } catch (e) {
++      logger.error('Position.syncWithExchange error:', e);
++      return this;
++    }
++  }
+ 
+   /**
+    * Обновляет ТОЛЬКО цену из котировок. НЕ меняет unrealizedPnl.
+    * (PnL тянем из биржи методами syncFromExchange / batch-синком в сервисе)
+    */
+   async updatePrice(currentPrice) {
+@@
+     }
+   }
+ 
++  /**
++   * НОВОЕ: живой синк полей из уже полученного объектa биржи.
++   * Вызывать из сервиса, куда уже пришли данные getPositions().
++   */
++  async syncFromExchange(exchangePosition) {
++    try {
++      if (!exchangePosition) return this;
++      const patch = {};
++      if (exchangePosition.markPrice !== undefined) {
++        patch.currentPrice = parseFloat(exchangePosition.markPrice);
++      }
++      if (exchangePosition.unrealizedPnl !== undefined) {
++        patch.unrealizedPnl = parseFloat(exchangePosition.unrealizedPnl);
++      }
++      if (exchangePosition.size !== undefined) {
++        patch.quantity = Math.abs(parseFloat(exchangePosition.size || 0));
++      }
++      if (exchangePosition.leverage !== undefined) {
++        patch.leverage = parseInt(exchangePosition.leverage, 10);
++      }
++      if (Object.keys(patch).length > 0) {
++        await this.update(patch);
++      }
++      return this;
++    } catch (e) {
++      logger.error('Position.syncFromExchange error:', e);
++      return this;
++    }
++  }
+@@
+   static async _dbSelectById(id) {
+     // SELECT * FROM positions WHERE id=...
+     // Замените на ORM
+     throw new Error('Position._dbSelectById must be implemented in your ORM layer');
+   }
