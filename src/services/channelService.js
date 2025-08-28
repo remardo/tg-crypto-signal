@@ -191,6 +191,26 @@ class ChannelService {
         logger.warn('Could not remove from Telegram monitoring:', error.message);
       }
 
+      // Delete all positions associated with this channel (both open and closed)
+      try {
+        const db = require('../database/connection');
+        await db.query('DELETE FROM positions WHERE channel_id = $1', [channelId]);
+        logger.info(`Deleted all positions for channel: ${channel.name}`);
+      } catch (error) {
+        logger.warn('Could not delete positions for channel:', error.message);
+        // Continue with channel deletion even if position deletion fails
+      }
+
+      // Delete all signals associated with this channel
+      try {
+        const db = require('../database/connection');
+        await db.query('DELETE FROM signals WHERE channel_id = $1', [channelId]);
+        logger.info(`Deleted all signals for channel: ${channel.name}`);
+      } catch (error) {
+        logger.warn('Could not delete signals for channel:', error.message);
+        // Continue with channel deletion even if signal deletion fails
+      }
+
       // Close sub-account (transfer remaining balance to main account)
       if (account) {
         try {

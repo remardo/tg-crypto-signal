@@ -52,6 +52,13 @@ const errorHandler = (err, req, res, next) => {
       status: 409,
       code: 'CONFLICT'
     };
+  } else if (err.message.includes('foreign key') || err.message.includes('внешнего ключа') || err.code === '23503') {
+    error = {
+      message: 'Cannot delete record due to existing references',
+      details: 'This record is referenced by other data and cannot be deleted',
+      status: 409,
+      code: 'FOREIGN_KEY_CONSTRAINT'
+    };
   } else if (err.message.includes('unauthorized') || err.message.includes('permission')) {
     error = {
       message: 'Unauthorized access',

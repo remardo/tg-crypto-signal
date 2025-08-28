@@ -22,6 +22,7 @@ const positionRoutes = require('./routes/positions');
 const dashboardRoutes = require('./routes/dashboard');
 const settingsRoutes = require('./routes/settings').router;
 const tradingRoutes = require('./routes/trading');
+const balanceRoutes = require('./routes/balance');
 
 // Import middleware
 const { errorHandler } = require('./middleware/errorHandler');
@@ -168,16 +169,35 @@ class Server {
   }
 
   setupRoutes() {
-    // Serve static files from public directory
-    this.app.use(express.static(path.join(__dirname, '../public')));
-
-    // API routes
+    // API routes - must be registered BEFORE static files
     this.app.use('/api/channels', channelRoutes);
     this.app.use('/api/signals', signalRoutes);
     this.app.use('/api/positions', positionRoutes);
     this.app.use('/api/dashboard', dashboardRoutes);
     this.app.use('/api/settings', settingsRoutes);
     this.app.use('/api/trading', tradingRoutes);
+    this.app.use('/api/balance', balanceRoutes);
+
+    // Direct balance route for testing
+    this.app.get('/api/balance-direct', (req, res) => {
+      res.json({
+        success: true,
+        data: {
+          futures: { balance: 0, availableBalance: 0 },
+          spot: { balance: 0, availableBalance: 0 },
+          timestamp: new Date().toISOString()
+        },
+        message: 'Direct balance route working!'
+      });
+    });
+
+    // Test route to verify API routing works
+    this.app.get('/api/test', (req, res) => {
+      res.json({ message: 'API routing is working!', timestamp: new Date().toISOString() });
+    });
+
+    // Serve static files from public directory
+    this.app.use(express.static(path.join(__dirname, '../public')));
 
     // Root endpoint - serve the web interface
     this.app.get('/', (req, res) => {
@@ -194,6 +214,7 @@ class Server {
           positions: '/api/positions',
           dashboard: '/api/dashboard',
           settings: '/api/settings',
+          balance: '/api/balance',
           health: '/health'
         },
         documentation: '/api/docs'

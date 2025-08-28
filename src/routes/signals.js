@@ -337,4 +337,49 @@ router.get('/recent/:hours',
   })
 );
 
+// POST /api/signals/cleanup - Cleanup old signals
+router.post('/cleanup',
+  sanitizeRequest,
+  asyncHandler(async (req, res) => {
+    const signalFeedService = req.app.locals.services.signalFeed;
+
+    const {
+      olderThanDays = 30,
+      status = null,
+      keepRecent = 1000
+    } = req.body;
+
+    // Validate input
+    if (olderThanDays < 1 || olderThanDays > 365) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          message: 'olderThanDays must be between 1 and 365'
+        }
+      });
+    }
+
+    if (keepRecent < 0 || keepRecent > 10000) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          message: 'keepRecent must be between 0 and 10000'
+        }
+      });
+    }
+
+    const result = await signalFeedService.cleanupOldSignals({
+      olderThanDays,
+      status,
+      keepRecent
+    });
+
+    res.json({
+      success: true,
+      message: `Cleanup completed: ${result.deleted} signals deleted, ${result.kept} signals kept`,
+      data: result
+    });
+  })
+);
+
 module.exports = router;

@@ -153,7 +153,25 @@ function ChannelManager({ channels = [], onRefresh }) {
           if (onRefresh) onRefresh();
         } catch (error) {
           console.error('Failed to delete channel:', error);
-          alert('Ошибка при удалении канала');
+
+          // Provide specific error messages based on the error
+          let errorMessage = 'Ошибка при удалении канала';
+
+          if (error.message) {
+            if (error.message.includes('open positions') || error.message.includes('открытых позиций')) {
+              errorMessage = '❌ Невозможно удалить канал с открытыми позициями!\n\n💡 Решение: Закройте все открытые позиции перед удалением канала.';
+            } else if (error.message.includes('foreign key') || error.message.includes('внешнего ключа') || error.message.includes('FOREIGN_KEY_CONSTRAINT')) {
+              errorMessage = '❌ Невозможно удалить канал из-за связанных данных!\n\n💡 Решение: Свяжитесь с администратором для принудительного удаления.';
+            } else if (error.message.includes('not found') || error.message.includes('не найден')) {
+              errorMessage = '❌ Канал не найден!\n\n💡 Решение: Обновите страницу и попробуйте снова.';
+            } else if (error.message.includes('permission') || error.message.includes('доступ')) {
+              errorMessage = '❌ Недостаточно прав для удаления канала!\n\n💡 Решение: Обратитесь к администратору.';
+            } else {
+              errorMessage = `❌ Ошибка: ${error.message}`;
+            }
+          }
+
+          alert(errorMessage);
         }
       }
     };

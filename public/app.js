@@ -43,8 +43,16 @@ function App() {
     };
 
     const [activeTab, setActiveTab] = React.useState(getCurrentTabFromHash());
-    const [isLoggedIn, setIsLoggedIn] = React.useState(false);
-    const [user, setUser] = React.useState(null);
+    const [isLoggedIn, setIsLoggedIn] = React.useState(() => {
+      // Check if user is logged in from localStorage
+      const savedLogin = localStorage.getItem('isLoggedIn');
+      return savedLogin === 'true';
+    });
+    const [user, setUser] = React.useState(() => {
+      // Load user data from localStorage
+      const savedUser = localStorage.getItem('user');
+      return savedUser ? JSON.parse(savedUser) : null;
+    });
     const [showLoginModal, setShowLoginModal] = React.useState(false);
 
     // Data state
@@ -158,6 +166,9 @@ function App() {
     const handleLogin = (userData) => {
       setIsLoggedIn(true);
       setUser(userData);
+      // Save to localStorage
+      localStorage.setItem('isLoggedIn', 'true');
+      localStorage.setItem('user', JSON.stringify(userData));
       navigateToTab('admin'); // Redirect to admin panel after login
       // Load fresh data after login
       loadAllData();
@@ -166,6 +177,9 @@ function App() {
     const handleLogout = () => {
       setIsLoggedIn(false);
       setUser(null);
+      // Clear from localStorage
+      localStorage.removeItem('isLoggedIn');
+      localStorage.removeItem('user');
       navigateToTab('dashboard');
     };
 
@@ -190,6 +204,9 @@ function App() {
         {activeTab === 'dashboard' && (
           <main>
             <HeroSection />
+            <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+              <BalanceWidget />
+            </div>
             <StatsSection />
             <FeaturesSection />
           </main>
@@ -203,6 +220,9 @@ function App() {
 
         {activeTab === 'admin' && isLoggedIn && (
           <main className="pt-20">
+            <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+              <BalanceWidget />
+            </div>
             <AdminPanel
               channels={channels}
               positions={positions}

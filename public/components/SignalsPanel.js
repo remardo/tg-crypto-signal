@@ -56,6 +56,44 @@ function SignalsPanel({ signals = [], onRefresh }) {
     setShowDetailsModal(true);
   };
 
+  // Cleanup old signals
+  const cleanupOldSignals = async () => {
+    const days = prompt('Введите количество дней (старше которых удалить сигналы):', '30');
+    if (!days || isNaN(days) || days < 1) {
+      alert('Пожалуйста, введите корректное количество дней (минимум 1)');
+      return;
+    }
+
+    const keepRecent = prompt('Сколько последних сигналов оставить (0 - удалить все):', '1000');
+    if (keepRecent === null) return; // Cancelled
+
+    if (isNaN(keepRecent) || keepRecent < 0) {
+      alert('Пожалуйста, введите корректное количество сигналов для сохранения');
+      return;
+    }
+
+    if (!confirm(`Вы уверены, что хотите удалить сигналы старше ${days} дней?\nБудет сохранено ${keepRecent} последних сигналов.`)) {
+      return;
+    }
+
+    try {
+      const response = await apiCall('/signals/cleanup', {
+        method: 'POST',
+        body: {
+          olderThanDays: parseInt(days),
+          keepRecent: parseInt(keepRecent)
+        }
+      });
+
+      alert(`✅ Очистка завершена!\nУдалено: ${response.data.deleted} сигналов\nСохранено: ${response.data.kept} сигналов`);
+
+      if (onRefresh) onRefresh();
+    } catch (error) {
+      console.error('Failed to cleanup signals:', error);
+      alert('❌ Ошибка при очистке сигналов: ' + error.message);
+    }
+  };
+
   const formatDateTime = (dateString) => {
     if (!dateString) return 'Неизвестно';
     try {
@@ -146,6 +184,17 @@ function SignalsPanel({ signals = [], onRefresh }) {
               <div className="flex items-center space-x-2">
                 <div className="icon-plus text-lg"></div>
                 <span>Добавить канал</span>
+              </div>
+            </button>
+
+            <button
+              onClick={cleanupOldSignals}
+              className="btn-danger"
+              title="Очистить старые сигналы"
+            >
+              <div className="flex items-center space-x-2">
+                <div className="icon-trash text-lg"></div>
+                <span>Очистить старые</span>
               </div>
             </button>
           </div>

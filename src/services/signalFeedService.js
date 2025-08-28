@@ -583,6 +583,78 @@ class SignalFeedService {
     }
   }
 
+  async cleanupOldSignals(options = {}) {
+    try {
+      const {
+        olderThanDays = 30,
+        status = null,
+        keepRecent = 1000
+      } = options;
+
+      logger.info(`Starting cleanup of old signals (older than ${olderThanDays} days, status: ${status || 'all'})`);
+
+      const db = require('../database/connection');
+      let query = `
+        SELECT id, processed_at, status
+        FROM signals
+        WHERE processed_at < NOW() - INTERVAL '${olderThanDays} days'
+      `;
+      const params = [];
+
+      if (status) {
+        query += ' AND status = $1';
+        params.push(status);
+      }
+
+      // Order by processed_at to keep most recent ones
+      query += ' ORDER BY processed_at ASC';
+
+      const result = await db.query(query, params);
+      const oldSignals = result.rows;
+
+      if (oldSignals.length === 0) {
+        logger.info('No old signals found for cleanup');
+        return { deleted: 0, kept: 0 };
+      }
+
+      // Keep the most recent signals if specified
+      let signalsToDelete = oldSignals;
+      if (keepRecent > 0 && oldSignals.length > keepRecent) {
+        signalsToDelete = oldSignals.slice(0, oldSignals.length - keepRecent);
+      }
+
+      logger.info(`Found ${oldSignals.length} old signals, will delete ${signalsToDelete.length}`);
+
+      // Delete signals and their associated positions
+      let deletedCount = 0;
+      for (const signal of signalsToDelete) {
+        try {
+          // Delete associated positions first
+          await db.query('DELETE FROM positions WHERE signal_id = $1', [signal.id]);
+
+          // Delete the signal
+          await db.query('DELETE FROM signals WHERE id = $1', [signal.id]);
+
+          deletedCount++;
+        } catch (error) {
+          logger.warn(`Failed to delete signal ${signal.id}:`, error.message);
+        }
+      }
+
+      logger.info(`Cleanup completed: deleted ${deletedCount} signals`);
+
+      return {
+        deleted: deletedCount,
+        kept: oldSignals.length - deletedCount,
+        totalFound: oldSignals.length
+      };
+
+    } catch (error) {
+      logger.error('Error during signal cleanup:', error);
+      throw error;
+    }
+  }
+
   async shutdown() {
     try {
       logger.info('Shutting down signal feed service...');
