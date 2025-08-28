@@ -318,18 +318,22 @@ The bot automatically monitors configured channels for trading signals.
 
   async addChannel(channelData) {
     try {
-      // Create channel in database
-      const channel = await Channel.create(channelData);
-      
+      // Find existing channel (it should already be created by ChannelService)
+      const channel = await Channel.findByTelegramId(channelData.telegramChannelId);
+
+      if (!channel) {
+        throw new Error(`Channel with Telegram ID ${channelData.telegramChannelId} not found in database`);
+      }
+
       // Add to monitored channels
       this.monitoredChannels.set(channel.telegramChannelId, channel);
-      
-      logger.info(`Added new channel for monitoring: ${channel.name}`);
-      
+
+      logger.info(`Added channel to Telegram monitoring: ${channel.name}`);
+
       return channel;
-      
+
     } catch (error) {
-      logger.error('Error adding channel:', error);
+      logger.error('Error adding channel to Telegram monitoring:', error);
       throw error;
     }
   }

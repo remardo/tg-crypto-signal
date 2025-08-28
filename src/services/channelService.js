@@ -69,13 +69,18 @@ class ChannelService {
       // Check if channel already exists
       const existingChannel = await Channel.findByTelegramId(telegramChannelId);
       if (existingChannel) {
-        throw new Error('Channel already exists');
+        logger.info(`Channel already exists: ${existingChannel.name} (${telegramChannelId})`);
+        throw new Error(`Канал с ID ${telegramChannelId} уже существует в системе`);
       }
 
-      // Get channel info from Telegram
+      // Get channel info from Telegram (only if bot is ready)
       let telegramInfo = null;
       try {
-        telegramInfo = await this.telegramService.getChannelInfo(telegramChannelId);
+        if (this.telegramService.isConnected && this.telegramService.bot) {
+          telegramInfo = await this.telegramService.getChannelInfo(telegramChannelId);
+        } else {
+          logger.info('Telegram bot not ready, skipping channel info retrieval');
+        }
       } catch (error) {
         logger.warn('Could not get Telegram channel info:', error.message);
       }

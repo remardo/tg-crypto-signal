@@ -3,372 +3,97 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Crypto Trading Bot - Панель управления</title>
-    <link rel="stylesheet" href="styles.css">
-    <!-- Временно убран Font Awesome для диагностики -->
+
+    <title>CryptoSignals Pro - Копирование сигналов с Telegram каналов</title>
+    <meta name="description" content="Профессиональный сервис для автоматического копирования торговых сигналов из Telegram каналов для работы с криптовалютами">
+    <meta name="keywords" content="криптовалюта, торговые сигналы, telegram, копирование сигналов, автоматическая торговля">
+
+    <meta property="og:title" content="CryptoSignals Pro - Копирование сигналов с Telegram">
+    <meta property="og:description" content="Автоматическое копирование торговых сигналов из Telegram каналов для криптовалют">
+
+    <meta name="twitter:title" content="CryptoSignals Pro - Копирование сигналов с Telegram">
+    <meta name="twitter:description" content="Автоматическое копирование торговых сигналов из Telegram каналов для криптовалют">
+
+    <script src="https://resource.trickle.so/vendor_lib/unpkg/react@18/umd/react.production.min.js"></script>
+    <script src="https://resource.trickle.so/vendor_lib/unpkg/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://resource.trickle.so/vendor_lib/unpkg/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://resource.trickle.so/vendor_lib/unpkg/lucide-static@0.516.0/font/lucide.css" rel="stylesheet">
+
+    <style type="text/tailwindcss">
+    @layer theme {
+        :root {
+            --primary-color: #3B82F6;
+            --secondary-color: #10B981;
+            --accent-color: #F59E0B;
+            --danger-color: #EF4444;
+            --background-dark: #0F172A;
+            --surface-dark: #1E293B;
+            --text-primary: #F1F5F9;
+            --text-secondary: #94A3B8;
+            --border-color: #334155;
+        }
+    }
+
+    @layer base {
+        body {
+            @apply bg-[var(--background-dark)] text-[var(--text-primary)] font-sans;
+        }
+
+        .gradient-bg {
+            background: linear-gradient(135deg, #0F172A 0%, #1E293B 100%);
+        }
+
+        .card-glow {
+            box-shadow: 0 0 20px rgba(59, 130, 246, 0.1);
+        }
+    }
+
+    @layer components {
+        .btn-primary {
+            @apply bg-[var(--primary-color)] text-white px-6 py-3 rounded-lg font-medium hover:bg-blue-600 transition-all duration-200;
+        }
+
+        .btn-secondary {
+            @apply bg-[var(--secondary-color)] text-white px-6 py-3 rounded-lg font-medium hover:bg-emerald-600 transition-all duration-200;
+        }
+
+        .card {
+            @apply bg-[var(--surface-dark)] border border-[var(--border-color)] rounded-xl p-6;
+        }
+
+        .input-field {
+            @apply bg-[var(--surface-dark)] border border-[var(--border-color)] rounded-lg px-4 py-3 text-[var(--text-primary)] placeholder-[var(--text-secondary)] focus:border-[var(--primary-color)] focus:outline-none transition-colors;
+        }
+
+        .stats-card {
+            @apply card text-center hover:card-glow transition-all duration-300;
+        }
+    }
+
+    @layer utilities {
+        .text-gradient {
+            background: linear-gradient(135deg, #3B82F6, #10B981);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+    }
+    </style>
 </head>
 <body>
-    <div class="app">
-        <!-- Sidebar -->
-        <nav class="sidebar">
-            <div class="sidebar-header">
-                <h2>🤖 Crypto Bot</h2>
-            </div>
-            <ul class="sidebar-menu">
-                <li><a href="#dashboard" class="menu-link active" data-page="dashboard">
-                    📊 Дашборд
-                </a></li>
-                <li><a href="#channels" class="menu-link" data-page="channels">
-                    📡 Каналы
-                </a></li>
-                <li><a href="#signals" class="menu-link" data-page="signals">
-                    📈 Сигналы
-                </a></li>
-                <li><a href="#positions" class="menu-link" data-page="positions">
-                    💰 Позиции
-                </a></li>
-                <li><a href="#settings" class="menu-link" data-page="settings">
-                    ⚙️ Настройки
-                </a></li>
-            </ul>
-        </nav>
+    <div id="root"></div>
 
-        <!-- Main Content -->
-        <main class="main-content">
-            <!-- Header -->
-            <header class="header">
-                <div class="header-left">
-                    <h1 id="page-title">Дашборд</h1>
-                </div>
-                <div class="header-right">
-                    <div class="status-indicator" id="connection-status">
-                        🔴
-                        <span>Подключение...</span>
-                    </div>
-                    <button class="btn-refresh" id="refresh-btn">
-                        🔄
-                    </button>
-                </div>
-            </header>
-
-            <!-- Page Content -->
-            <div class="content">
-                <!-- Dashboard Page -->
-                <div id="dashboard-page" class="page active">
-                    <div class="stats-grid">
-                        <div class="stat-card">
-                            <div class="stat-icon">
-                                📡
-                            </div>
-                            <div class="stat-info">
-                                <h3 id="total-channels">0</h3>
-                                <p>Активных каналов</p>
-                            </div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-icon">
-                                📈
-                            </div>
-                            <div class="stat-info">
-                                <h3 id="total-signals">0</h3>
-                                <p>Сигналов сегодня</p>
-                            </div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-icon">
-                                💰
-                            </div>
-                            <div class="stat-info">
-                                <h3 id="open-positions">0</h3>
-                                <p>Открытых позиций</p>
-                            </div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-icon">
-                                💵
-                            </div>
-                            <div class="stat-info">
-                                <h3 id="total-pnl">$0.00</h3>
-                                <p>Общий P&L</p>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="dashboard-content">
-                        <div class="card">
-                            <div class="card-header">
-                                <h3>Системный статус</h3>
-                            </div>
-                            <div class="card-body">
-                                <div id="system-status" class="system-status">
-                                    <div class="service-status">
-                                        <span class="service-name">Telegram Bot</span>
-                                        <span class="status-badge" id="telegram-status">Загрузка...</span>
-                                    </div>
-                                    <div class="service-status">
-                                        <span class="service-name">Redis</span>
-                                        <span class="status-badge" id="redis-status">Загрузка...</span>
-                                    </div>
-                                    <div class="service-status">
-                                        <span class="service-name">PostgreSQL</span>
-                                        <span class="status-badge" id="postgres-status">Загрузка...</span>
-                                    </div>
-                                    <div class="service-status">
-                                        <span class="service-name">BingX API</span>
-                                        <span class="status-badge" id="bingx-status">Загрузка...</span>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="card">
-                            <div class="card-header">
-                                <h3>Последние сигналы</h3>
-                            </div>
-                            <div class="card-body">
-                                <div id="recent-signals" class="signals-list">
-                                    <p class="loading">Загрузка сигналов...</p>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Channels P&L Section -->
-                <div class="card">
-                    <div class="card-header">
-                        <h3>P&L по каналам</h3>
-                    </div>
-                    <div class="card-body">
-                        <div id="channels-pnl" class="channels-pnl-list">
-                            <p class="loading">Загрузка P&L по каналам...</p>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Channels Page -->
-                <div id="channels-page" class="page">
-                    <div class="page-header">
-                        <button class="btn btn-primary" id="add-channel-btn">
-                            ➕ Добавить канал
-                        </button>
-                    </div>
-                    <div class="card">
-                        <div class="card-header">
-                            <h3>Список каналов</h3>
-                        </div>
-                        <div class="card-body">
-                            <div id="channels-table" class="table-container">
-                                <p class="loading">Загрузка каналов...</p>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Signals Page -->
-                <div id="signals-page" class="page">
-                    <div class="page-header">
-                        <div class="filters">
-                            <select id="signal-filter-channel">
-                                <option value="">Все каналы</option>
-                            </select>
-                            <select id="signal-filter-status">
-                                <option value="">Все статусы</option>
-                                <option value="pending">Ожидание</option>
-                                <option value="executed">Выполнено</option>
-                                <option value="failed">Ошибка</option>
-                            </select>
-                        </div>
-                    </div>
-                    <div class="card">
-                        <div class="card-header">
-                            <h3>Торговые сигналы</h3>
-                        </div>
-                        <div class="card-body">
-                            <div id="signals-table" class="table-container">
-                                <p class="loading">Загрузка сигналов...</p>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Positions Page -->
-                <div id="positions-page" class="page">
-                    <div class="card">
-                        <div class="card-header">
-                            <h3>Торговые позиции</h3>
-                        </div>
-                        <div class="card-body">
-                            <div id="positions-table" class="table-container">
-                                <p class="loading">Загрузка позиций...</p>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Settings Page -->
-                <div id="settings-page" class="page">
-                    <div class="settings-grid">
-                        <div class="card">
-                            <div class="card-header">
-                                <h3>Общие настройки</h3>
-                            </div>
-                            <div class="card-body">
-                                <form id="general-settings-form">
-                                    <div class="form-group">
-                                        <label for="auto-execute">Автоматическое выполнение сигналов</label>
-                                        <input type="checkbox" id="auto-execute" name="autoExecute">
-                                    </div>
-                                    <div class="form-group">
-                                        <label for="default-risk">Риск по умолчанию (%)</label>
-                                        <input type="number" id="default-risk" name="defaultRisk" min="0.1" max="10" step="0.1" value="2">
-                                    </div>
-                                    <button type="submit" class="btn btn-primary">Сохранить</button>
-                                </form>
-                            </div>
-                        </div>
-                        
-                        <div class="card">
-                            <div class="card-header">
-                                <h3>🛡️ Риск-менеджмент</h3>
-                            </div>
-                            <div class="card-body">
-                                <div class="form-group">
-                                    <div class="risk-management-toggle">
-                                        <label for="disable-risk-management" class="toggle-label">
-                                            <span class="toggle-text">Отключить все проверки риск-менеджмента</span>
-                                            <div class="toggle-switch">
-                                                <input type="checkbox" id="disable-risk-management" name="disableRiskManagement">
-                                                <span class="toggle-slider"></span>
-                                            </div>
-                                        </label>
-                                        <small class="warning-text">⚠️ ВНИМАНИЕ: При отключении бот будет принимать ВСЕ сигналы без проверки качества и риска!</small>
-                                    </div>
-                                </div>
-                                <div class="risk-status">
-                                    <div class="status-indicator" id="risk-management-status">
-                                        <span class="status-icon">🛡️</span>
-                                        <span class="status-text">Активен</span>
-                                    </div>
-                                </div>
-                                <button type="button" class="btn btn-primary" id="save-risk-settings">Применить настройки</button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </main>
-    </div>
-
-    <!-- Modals -->
-    <div id="add-channel-modal" class="modal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h3>Добавить канал</h3>
-                <button class="modal-close">&times;</button>
-            </div>
-            <div class="modal-body">
-                <form id="add-channel-form">
-                    <div class="form-group">
-                        <label for="channel-telegram-id">Telegram Channel ID</label>
-                        <input type="text" id="channel-telegram-id" name="telegramChannelId" required>
-                        <small>Например: @tradingchannel или -1001234567890</small>
-                    </div>
-                    <div class="form-group">
-                        <label for="channel-name">Название канала</label>
-                        <input type="text" id="channel-name" name="name" required>
-                    </div>
-                    <div class="form-group">
-                        <label for="channel-description">Описание</label>
-                        <textarea id="channel-description" name="description"></textarea>
-                    </div>
-                    <div class="form-group">
-                        <label for="channel-risk">Риск (%) на позицию</label>
-                        <input type="number" id="channel-risk" name="riskPercentage" min="0.1" max="20" step="0.1" value="2">
-                    </div>
-                    <div class="form-group">
-                        <label for="channel-auto-execute">Автоматическое выполнение</label>
-                        <input type="checkbox" id="channel-auto-execute" name="autoExecute">
-                    </div>
-                    <div class="form-group">
-                        <label>Проценты закрытия на тейк-профитах</label>
-                        <div class="tp-percentages-container">
-                            <div class="tp-row">
-                                <label>TP1 (%):</label>
-                                <input type="number" name="tpPercentage1" min="0.1" max="100" step="0.1" value="25" class="tp-input">
-                            </div>
-                            <div class="tp-row">
-                                <label>TP2 (%):</label>
-                                <input type="number" name="tpPercentage2" min="0.1" max="100" step="0.1" value="25" class="tp-input">
-                            </div>
-                            <div class="tp-row">
-                                <label>TP3 (%):</label>
-                                <input type="number" name="tpPercentage3" min="0.1" max="100" step="0.1" value="50" class="tp-input">
-                            </div>
-                            <button type="button" class="btn btn-small btn-secondary" id="add-tp-level">+ Добавить TP</button>
-                        </div>
-                        <small>Сумма всех процентов должна составлять 100%</small>
-                    </div>
-                    <div class="form-actions">
-                        <button type="button" class="btn btn-secondary" id="cancel-add-channel">Отмена</button>
-                        <button type="submit" class="btn btn-primary">Добавить</button>
-                    </div>
-                </form>
-            </div>
-        </div>
-    </div>
-
-    <!-- Edit Channel Modal -->
-    <div id="edit-channel-modal" class="modal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h3>Редактировать канал</h3>
-                <button class="modal-close">&times;</button>
-            </div>
-            <div class="modal-body">
-                <form id="edit-channel-form">
-                    <div class="form-group">
-                        <label for="edit-channel-telegram-id">Telegram Channel ID</label>
-                        <input type="text" id="edit-channel-telegram-id" name="telegramChannelId" readonly>
-                        <small>ID канала нельзя изменить</small>
-                    </div>
-                    <div class="form-group">
-                        <label for="edit-channel-name">Название канала</label>
-                        <input type="text" id="edit-channel-name" name="name" required>
-                    </div>
-                    <div class="form-group">
-                        <label for="edit-channel-description">Описание</label>
-                        <textarea id="edit-channel-description" name="description"></textarea>
-                    </div>
-                    <div class="form-group">
-                        <label for="edit-channel-risk">Риск (%) на позицию</label>
-                        <input type="number" id="edit-channel-risk" name="riskPercentage" min="0.1" max="20" step="0.1">
-                    </div>
-                    <div class="form-group">
-                        <label for="edit-channel-max-position">Максимальный размер позиции (%)</label>
-                        <input type="number" id="edit-channel-max-position" name="maxPositionPercentage" min="1" max="100" step="1">
-                    </div>
-                    <div class="form-group">
-                        <label for="edit-channel-auto-execute">Автоматическое выполнение</label>
-                        <input type="checkbox" id="edit-channel-auto-execute" name="autoExecute">
-                    </div>
-                    <div class="form-group">
-                        <label>Проценты закрытия на тейк-профитах</label>
-                        <div class="tp-percentages-container" id="edit-tp-container">
-                            <!-- TP percentage inputs will be populated dynamically -->
-                        </div>
-                        <small>Сумма всех процентов должна составлять 100%</small>
-                    </div>
-                    <div class="form-actions">
-                        <button type="button" class="btn btn-secondary" id="cancel-edit-channel">Отмена</button>
-                        <button type="submit" class="btn btn-primary">Сохранить изменения</button>
-                    </div>
-                </form>
-            </div>
-        </div>
-    </div>
-
-    <!-- Scripts -->
-    <script src="app.js"></script>
+    <script type="text/babel" src="components/Header.js"></script>
+    <script type="text/babel" src="components/HeroSection.js"></script>
+    <script type="text/babel" src="components/StatsSection.js"></script>
+    <script type="text/babel" src="components/FeaturesSection.js"></script>
+    <script type="text/babel" src="components/SignalsPanel.js"></script>
+    <script type="text/babel" src="components/AdminPanel.js"></script>
+    <script type="text/babel" src="components/ChannelManager.js"></script>
+    <script type="text/babel" src="components/PnLDashboard.js"></script>
+    <script type="text/babel" src="components/Footer.js"></script>
+    <script type="text/babel" src="components/LoginModal.js"></script>
+    <script type="text/babel" src="app.js"></script>
 </body>
 </html>

@@ -311,22 +311,25 @@ class BingXService {
 
   async createSubAccount(tag, email = null) {
     try {
-      const endpoint = '/openApi/spot/v1/account/subAccount/create';
-      const params = { tag, ...(email && { email }) };
+      // BingX doesn't support sub-accounts for perpetual trading
+      // We'll create a placeholder sub-account for tracking purposes
+      const subAccountId = `placeholder_${tag}_${Date.now()}`;
 
-      const result = await this.makeRequest('POST', endpoint, params);
+      logger.info('BingX sub-accounts not supported - using placeholder:', subAccountId);
 
       tradeLog('sub_account_created', {
-        subAccountId: result.subAccountId,
+        subAccountId,
         tag,
         email,
+        isPlaceholder: true
       });
 
       return {
-        subAccountId: result.subAccountId,
-        tag: result.tag,
-        email: result.email,
-        status: result.status,
+        subAccountId,
+        tag,
+        email,
+        status: 'active',
+        isPlaceholder: true
       };
     } catch (error) {
       logger.error('Error creating sub-account:', error);
