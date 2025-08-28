@@ -88,13 +88,22 @@ cd tg_crypto_signal
 npm install
 ```
 
-3. **Setup environment variables**
+3. **Build frontend assets**
+```bash
+# Development build
+npm run build:dev
+
+# Production build
+npm run build
+```
+
+4. **Setup environment variables**
 ```bash
 cp .env.example .env
 # Edit .env with your credentials
 ```
 
-4. **Setup database**
+5. **Setup database**
 ```bash
 # Create PostgreSQL database
 createdb tg_crypto_signal
@@ -103,12 +112,12 @@ createdb tg_crypto_signal
 npm run migrate
 ```
 
-5. **Start Redis**
+6. **Start Redis**
 ```bash
 redis-server
 ```
 
-6. **Start the application**
+7. **Start the application**
 ```bash
 # Development mode
 npm run dev
@@ -348,7 +357,105 @@ pg_dump tg_crypto_signal > backup.sql
 redis-cli BGSAVE
 ```
 
-## 📞 Support
+## � VPS Deployment
+
+### Prerequisites
+- Ubuntu/Debian server with sudo access
+- Node.js 18+ installed
+- PostgreSQL installed and running
+- Redis installed and running
+- PM2 process manager (optional but recommended)
+
+### VPS Setup Steps
+
+1. **Update system and install dependencies**
+```bash
+sudo apt update
+sudo apt install -y curl wget git
+```
+
+2. **Install Node.js 18+**
+```bash
+curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+sudo apt-get install -y nodejs
+```
+
+3. **Install PostgreSQL and Redis**
+```bash
+sudo apt install -y postgresql postgresql-contrib redis-server
+sudo systemctl start postgresql
+sudo systemctl enable postgresql
+sudo systemctl start redis-server
+sudo systemctl enable redis-server
+```
+
+4. **Install PM2 globally**
+```bash
+sudo npm install -g pm2
+```
+
+5. **Clone and setup project**
+```bash
+git clone <your-repository-url>
+cd tg_crypto_signal
+npm install
+```
+
+6. **Build frontend assets**
+```bash
+npm run build
+```
+
+7. **Setup environment**
+```bash
+cp .env.example .env
+# Edit .env with your production credentials
+```
+
+8. **Setup database**
+```bash
+sudo -u postgres createdb tg_crypto_signal
+sudo -u postgres createuser --interactive --pwprompt tg_crypto_user
+npm run migrate
+```
+
+9. **Start with PM2**
+```bash
+pm2 start src/server.js --name "tg-crypto-signal"
+pm2 save
+pm2 startup
+```
+
+10. **Setup Nginx (optional)**
+```bash
+sudo apt install -y nginx
+# Configure nginx to proxy to localhost:3000
+```
+
+### Troubleshooting VPS Issues
+
+#### Build Errors
+If you get `postcss-loader` errors during build:
+```bash
+# Clean node_modules and reinstall
+rm -rf node_modules package-lock.json
+npm install
+npm run build
+```
+
+#### Missing Dependencies
+```bash
+# Install missing build tools
+sudo apt-get install -y build-essential
+```
+
+#### Permission Issues
+```bash
+# Fix npm permissions
+sudo chown -R $USER:$USER ~/.npm
+```
+
+## �📞 Support
 
 For issues and questions:
 1. Check the logs in `logs/` directory
