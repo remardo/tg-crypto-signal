@@ -22,31 +22,78 @@ const createRedisClient = (options = {}) => {
 };
 
 const connectRedis = async () => {
+  const wantMock = String(process.env.REDIS_MOCK || '').toLowerCase() === 'true';
   try {
+    if (wantMock) {
+      // Explicitly requested mock via env var
+      const mock = require('./redis-mock');
+      const { redisClient: mockClientGetter, redisSubscriber: mockSubGetter } = mock;
+      // Initialize mock (no-op connect internally)
+      await mock.connectRedis?.().catch(() => {});
+      redisClient = mockClientGetter();
+      redisSubscriber = mockSubGetter();
+      logger.warn('Using Redis MOCK as requested by REDIS_MOCK=true');
+      return { redisClient, redisSubscriber };
+    }
+
     // Main Redis client
     redisClient = createRedisClient();
-    
+
+    // Attach listeners BEFORE connect to avoid races
     redisClient.on('error', (err) => {
       logger.error('Redis Client Error:', err);
     });
-
     redisClient.on('connect', () => {
       logger.info('Redis Client Connected');
     });
-
     redisClient.on('ready', () => {
       logger.info('Redis Client Ready');
     });
-
     redisClient.on('end', () => {
       logger.info('Redis Client Connection Ended');
     });
 
+    const waitForReady = () => new Promise((resolve, reject) => {
+      // If already ready, resolve immediately
+      if (redisClient.isReady) return resolve();
+
+      let settled = false;
+      const timeoutMs = Number(process.env.REDIS_READY_TIMEOUT_MS || 10000);
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new Error('REDIS_READY_TIMEOUT'));
+      }, timeoutMs);
+
+      const onReady = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      };
+      const onError = (err) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(err);
+      };
+      const cleanup = () => {
+        clearTimeout(timer);
+        redisClient.off('ready', onReady);
+        redisClient.off('error', onError);
+      };
+
+      redisClient.once('ready', onReady);
+      redisClient.once('error', onError);
+    });
+
     await redisClient.connect();
+    await waitForReady();
 
     // Subscriber client for pub/sub
     redisSubscriber = createRedisClient();
-    
+
     redisSubscriber.on('error', (err) => {
       logger.error('Redis Subscriber Error:', err);
     });
@@ -55,9 +102,23 @@ const connectRedis = async () => {
 
     logger.info('Redis connections established successfully');
     return { redisClient, redisSubscriber };
-    
   } catch (error) {
     logger.error('Failed to connect to Redis:', error);
+    const isConnRefused = (error && (error.code === 'ECONNREFUSED' || String(error.message).includes('ECONNREFUSED')));
+    // Fall back to mock if explicitly requested, in development, or when connection refused
+    if (wantMock || config.isDevelopment() || isConnRefused) {
+      try {
+        const mock = require('./redis-mock');
+        const { redisClient: mockClientGetter, redisSubscriber: mockSubGetter } = mock;
+        await mock.connectRedis?.().catch(() => {});
+        redisClient = mockClientGetter();
+        redisSubscriber = mockSubGetter();
+        logger.warn('Redis not available. Falling back to Redis MOCK.');
+        return { redisClient, redisSubscriber };
+      } catch (mockErr) {
+        logger.error('Failed to initialize Redis MOCK fallback:', mockErr);
+      }
+    }
     throw error;
   }
 };

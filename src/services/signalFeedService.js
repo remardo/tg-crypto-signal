@@ -509,31 +509,24 @@ class SignalFeedService {
 
   async retryFailedMessages(limit = 10) {
     try {
-      const failedMessages = await redisUtils.lRange('failed_messages', 0, limit - 1);
-      
-      if (failedMessages.length === 0) {
-        return { retried: 0, success: 0, failed: 0 };
-      }
-
       let success = 0;
       let failed = 0;
+      let retried = 0;
 
-      for (const failedMessage of failedMessages) {
+      for (let i = 0; i < limit; i++) {
+        const failedMessage = await redisUtils.rPop('failed_messages');
+        if (!failedMessage) break; // nothing left to retry
+        retried++;
+
         try {
-          // Remove from failed queue
-          await redisUtils.sRem('failed_messages', failedMessage);
-          
-          // Retry processing
           await this.processMessage(failedMessage);
           success++;
-          
         } catch (error) {
           failed++;
-          
           // Increment retry count
           failedMessage.retryCount = (failedMessage.retryCount || 0) + 1;
-          
-          // If too many retries, move to permanent failure
+
+          // If too many retries, move to permanent failure; else push back to failed
           if (failedMessage.retryCount >= 3) {
             await redisUtils.lPush('permanent_failures', failedMessage);
           } else {
@@ -545,7 +538,7 @@ class SignalFeedService {
       logger.info(`Retry completed: ${success} success, ${failed} failed`);
 
       return {
-        retried: failedMessages.length,
+        retried,
         success,
         failed
       };

@@ -435,7 +435,8 @@ class BingXService {
         symbol: orderResult.symbol || formattedSymbol,
         side: orderResult.side || orderData.side,
         positionSide: orderResult.positionSide || positionSide,
-        status: orderResult.status || 'FILLED',
+        // Do NOT assume FILLED; keep the exchange-provided status or default to NEW
+        status: orderResult.status || 'NEW',
         executedQty: parseFloat(orderResult.executedQty || orderResult.quantity || 0),
         executedPrice: parseFloat(orderResult.avgPrice || orderResult.price || 0),
       };

@@ -16,6 +16,11 @@ class TelegramService {
   async initialize() {
     try {
       if (!config.telegram.botToken) {
+        if (config.isDevelopment()) {
+          logger.warn('Telegram bot token is missing. Continuing without Telegram integration in development mode.');
+          this.isConnected = false;
+          return true; // allow server to start
+        }
         throw new Error('Telegram bot token is required');
       }
 

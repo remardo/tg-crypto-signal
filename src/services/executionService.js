@@ -185,10 +185,32 @@ class ExecutionService {
       const effectiveSubAccountId = subAccountId && subAccountId !== 'main_account' ? subAccountId : null;
       const orderResult = await this.placeOrder(signal, positionSize, symbol, effectiveSubAccountId);
 
-      // запись позиции
+      // Wait for the position to be actually opened on the exchange before creating a local one
+      const appeared = await this.waitForExchangePosition(symbol, effectiveSubAccountId, 8000);
+      if (!appeared) {
+        const msg = 'Entry order not confirmed on exchange within timeout';
+        logger.warn(msg, { symbol, orderId: orderResult.orderId, status: orderResult.status });
+        throw new Error(msg);
+      }
+
+      // fetch fresh exchange position details to capture entryPrice/side accurately
+      try {
+        const exPositions = await this.bingx.getPositions(effectiveSubAccountId);
+        const exPos = Array.isArray(exPositions)
+          ? exPositions.find((p) => p.symbol === symbol && p.size && Math.abs(p.size) > 0)
+          : null;
+        if (exPos) {
+          orderResult.executedPrice = exPos.entryPrice || orderResult.executedPrice;
+          orderResult.side = exPos.side || orderResult.side;
+        }
+      } catch (e) {
+        logger.warn('Failed to fetch exchange position after order placement', { symbol, error: e.message });
+      }
+
+      // запись позиции (только после подтверждения с биржи)
       const position = await this.createPosition(signal, orderResult, account, positionSize, channel, subAccountId);
 
-      // стоп и все ТП (TP1 дублируется – остаётся привязанным к главному ордеру, а для надёжности создадим отдельный TP_MARKET на TP2/TP3)
+      // стоп и все ТП (TP1/TP2/TP3) ставим только при наличии позиции на бирже
       const rmOrders = await this.placeRiskManagementOrders(position, signal, subAccountId, channel, symbolInfo);
 
       await signal.execute();
@@ -288,6 +310,19 @@ class ExecutionService {
           minQty: exchangeMinQty.toFixed(8), stepSize: stepSize.toFixed(8),
           finalQuantity: finalQty.toFixed(8), finalValue: finalQty.times(entryPrice).toFixed(2)
         });
+
+        // Enforce minimal notional (min USDT value) if provided by exchange
+        if (symbolInfo.minOrderValue) {
+          const minNotional = new Decimal(symbolInfo.minOrderValue);
+          const minQtyByVal = minNotional.div(entryPrice);
+          if (finalQty.lessThan(minQtyByVal)) {
+            finalQty = minQtyByVal.div(stepSize).floor().times(stepSize);
+            if (finalQty.lessThan(exchangeMinQty)) finalQty = exchangeMinQty;
+            logger.info('Adjusted to meet min notional', {
+              minNotional: minNotional.toFixed(2), adjustedQty: finalQty.toFixed(8)
+            });
+          }
+        }
       } else {
         const minOrderValue = new Decimal(5);
         const minQtyByVal = minOrderValue.div(entryPrice);
@@ -328,6 +363,12 @@ class ExecutionService {
 
       if (signal.leverage && signal.leverage > symbolInfo.maxLeverage) {
         errors.push(`Leverage ${signal.leverage} exceeds symbol maximum ${symbolInfo.maxLeverage}`);
+      }
+      if (symbolInfo.minOrderValue) {
+        const notional = quantity * entryPrice;
+        if (notional < symbolInfo.minOrderValue) {
+          errors.push(`Order notional ${notional.toFixed(2)} below exchange minimum ${symbolInfo.minOrderValue}`);
+        }
       }
     } catch (error) {
       errors.push(`Validation error: ${error.message}`);
@@ -645,6 +686,28 @@ class ExecutionService {
   roundToStepSize(quantity, stepSize) {
     if (!stepSize || stepSize <= 0) return quantity;
     return Math.floor(quantity / stepSize) * stepSize;
+  }
+
+  async waitForExchangePosition(symbol, subAccountId = null, timeoutMs = 8000) {
+    // In mock mode, skip waiting to keep dev/test fast
+    try { if (this.bingx && this.bingx.mode === 'mock') return true; } catch (e) {}
+    const start = Date.now();
+    const poll = 1000;
+    const formatted = this.formatSymbol(symbol);
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const positions = await this.bingx.getPositions(subAccountId);
+        if (Array.isArray(positions)) {
+          const p = positions.find((x) => x.symbol === formatted && x.size && Math.abs(x.size) > 0);
+          if (p) return true;
+        }
+      } catch (e) {
+        // ignore transient errors during poll
+      }
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((r) => setTimeout(r, poll));
+    }
+    return false;
   }
 
   async getExecutionStats() {
