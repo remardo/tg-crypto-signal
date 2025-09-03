@@ -456,13 +456,14 @@ class ExecutionService {
       const effectiveSubAccountId = subAccountId && subAccountId !== 'main_account' ? subAccountId : null;
       const pricePrecision = symbolInfo?.pricePrecision || 6;
       const stepSize = symbolInfo?.stepSize || 0.001;
+      const minQty = symbolInfo?.minQty || 0.0001;
 
       // ---- STOP LOSS ----
       let slOrderId = null;
       if (signal.stopLoss) {
         try {
           const stopLossPrice = parseFloat(signal.stopLoss);
-          const stopLossOrder = {
+          const baseOrder = {
             symbol: position.symbol,
             side: position.side === 'BUY' ? 'SELL' : 'BUY',
             positionSide: position.side === 'BUY' ? 'LONG' : 'SHORT',
@@ -474,14 +475,31 @@ class ExecutionService {
             recvWindow: 5000,
             clientOrderId: `sl_${Date.now()}`
           };
-          const slRes = await this.bingx.placeOrder(stopLossOrder, effectiveSubAccountId);
+
+          const { result: slRes, usedQty: slQty } = await this.placeReduceOnlyConditionalWithRetry(
+            baseOrder,
+            effectiveSubAccountId,
+            { stepSize, pricePrecision, minQty },
+            3,
+            this.roundToStepSize(position.quantity, stepSize),
+            'SL'
+          );
+
           slOrderId = slRes?.orderId || null;
-          orders.push({ type: 'stop_loss', order: slRes });
+          orders.push({ type: 'stop_loss', order: slRes, qty: slQty });
           logger.info('Placed STOP_MARKET stop-loss', {
-            symbol: position.symbol, stopPrice: stopLossOrder.stopPrice, orderId: slRes?.orderId
+            symbol: position.symbol,
+            stopPrice: baseOrder.stopPrice,
+            qty: slQty,
+            orderId: slRes?.orderId
           });
         } catch (error) {
-          logger.error('Error placing STOP_MARKET stop-loss order:', error);
+          logger.error('Error placing STOP_MARKET stop-loss order:', {
+            message: error.message,
+            symbol: position.symbol,
+            stopPrice: signal.stopLoss,
+            side: position.side === 'BUY' ? 'SELL' : 'BUY'
+          });
         }
       }
 
@@ -515,7 +533,7 @@ class ExecutionService {
         tpQty = this.roundToStepSize(Math.min(tpQty, remainingQty), stepSize);
         if (tpQty <= 0) continue;
 
-        const takeProfitOrder = {
+        const baseTP = {
           symbol: position.symbol,
           side: position.side === 'BUY' ? 'SELL' : 'BUY',
           positionSide: position.side === 'BUY' ? 'LONG' : 'SHORT',
@@ -529,14 +547,26 @@ class ExecutionService {
         };
 
         try {
-          const tpRes = await this.bingx.placeOrder(takeProfitOrder, effectiveSubAccountId);
-          orders.push({ type: `take_profit_${i + 1}`, order: tpRes });
-          remainingQty = this.roundToStepSize(remainingQty - tpQty, stepSize);
+          const { result: tpRes, usedQty } = await this.placeReduceOnlyConditionalWithRetry(
+            baseTP,
+            effectiveSubAccountId,
+            { stepSize, pricePrecision, minQty },
+            3,
+            remainingQty,
+            `TP${i + 1}`
+          );
+          orders.push({ type: `take_profit_${i + 1}`, order: tpRes, qty: usedQty });
+          remainingQty = this.roundToStepSize(remainingQty - usedQty, stepSize);
           logger.info(`Placed TP${i + 1} TAKE_PROFIT_MARKET`, {
-            price: takeProfitOrder.stopPrice, qty: takeProfitOrder.quantity, orderId: tpRes?.orderId
+            price: baseTP.stopPrice, qty: usedQty, orderId: tpRes?.orderId
           });
         } catch (e) {
-          logger.error(`Error placing TP${i + 1} TAKE_PROFIT_MARKET:`, e);
+          logger.error(`Error placing TP${i + 1} TAKE_PROFIT_MARKET:`, {
+            message: e.message,
+            symbol: position.symbol,
+            stopPrice: tpPrice,
+            requestedQty: tpQty
+          });
         }
       }
 
@@ -553,6 +583,91 @@ class ExecutionService {
       logger.error('Error placing risk management orders:', error);
       return [];
     }
+  }
+
+  /**
+   * Пытается выставить reduceOnly условный ордер (SL/TP). При ошибке BingX про
+   * "available amount of XX USDT" адаптирует количество на основе цены триггера
+   * и повторяет попытку до maxAttempts раз.
+   * Возвращает { result, usedQty }.
+   */
+  async placeReduceOnlyConditionalWithRetry(baseOrder, subAccountId, symbolMeta, maxAttempts = 3, limitQty = null, context = 'RM') {
+    const stepSize = symbolMeta?.stepSize || 0.001;
+    const minQty = symbolMeta?.minQty || 0.0001;
+    let attempt = 0;
+    let lastError;
+    // начальное желаемое количество с округлением вниз
+    let desiredQty = this.roundToStepSize(
+      limitQty != null ? Math.min(Number(baseOrder.quantity), Number(limitQty)) : Number(baseOrder.quantity),
+      stepSize
+    );
+
+    while (attempt < maxAttempts) {
+      attempt += 1;
+      const tryQty = this.roundToStepSize(Math.max(desiredQty, 0), stepSize);
+      if (tryQty <= 0 || tryQty < minQty) {
+        lastError = new Error(`Calculated quantity too small for ${context}: ${tryQty}`);
+        break;
+      }
+      const orderToSend = { ...baseOrder, quantity: tryQty };
+      try {
+        const res = await this.bingx.placeOrder(orderToSend, subAccountId);
+        return { result: res, usedQty: tryQty };
+      } catch (err) {
+        lastError = err;
+        const msg = String(err.message || '');
+        // Ищем шаблон "available amount of <num> USDT"
+        const m = msg.match(/available amount of\s*([0-9]*\.?[0-9]+)\s*USDT/i) || msg.match(/available amount\s*:?\s*([0-9]*\.?[0-9]+)/i);
+        if (!m) {
+          // Не наш кейс — прерываем цикл
+          break;
+        }
+        const availableUSDT = parseFloat(m[1]);
+        // Цена для перевода USDT->qty: используем stopPrice из ордера
+        let refPrice = parseFloat(baseOrder.stopPrice || '0');
+        if (!Number.isFinite(refPrice) || refPrice <= 0) {
+          try {
+            const p = await this.bingx.getSymbolPrice(baseOrder.symbol);
+            refPrice = Number(p.price || 0);
+          } catch (_) {
+            // если не удалось — прекращаем ретраи
+            break;
+          }
+        }
+
+        if (!Number.isFinite(refPrice) || refPrice <= 0) break;
+
+        // Кол-во, которое ДОЛЖНО быть СТРОГО МЕНЬШЕ доступной суммы (переводим USDT в базу)
+        let maxQtyByAvail = availableUSDT / refPrice;
+        // округляем вниз к шагу и вычитаем ещё один шаг, чтобы было "< available"
+        maxQtyByAvail = this.roundToStepSize(maxQtyByAvail, stepSize) - stepSize;
+        if (limitQty != null) maxQtyByAvail = Math.min(maxQtyByAvail, limitQty);
+        // также не превышаем изначально запрошенное
+        maxQtyByAvail = Math.min(maxQtyByAvail, Number(baseOrder.quantity));
+
+        // если стало слишком мало — выходим
+        if (!Number.isFinite(maxQtyByAvail) || maxQtyByAvail <= 0) {
+          break;
+        }
+
+        // применяем минимум и шаг
+        desiredQty = this.roundToStepSize(Math.max(maxQtyByAvail, minQty), stepSize);
+        // следующий цикл попробует заново
+        logger.warn('Adjusting reduceOnly conditional order due to available amount constraint', {
+          context,
+          symbol: baseOrder.symbol,
+          stopPrice: baseOrder.stopPrice,
+          prevQty: tryQty,
+          newQty: desiredQty,
+          availableUSDT,
+          refPrice
+        });
+        continue;
+      }
+    }
+
+    // если дошли сюда — все попытки исчерпаны
+    throw lastError || new Error(`Failed to place ${context} order`);
   }
 
   startBreakevenWatcher(position, slOrderId, subAccountId, pricePrecision, stepSize) {
