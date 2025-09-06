@@ -7,6 +7,7 @@ function ChannelManager({ channels = [], onRefresh }) {
     telegramChannelId: '',
     isActive: true,
     isPaused: false,
+  autoExecute: false,
     maxPositionPercentage: 100,
     riskPercentage: 2,
     tpPercentages: [25.0, 25.0, 50.0]
@@ -58,6 +59,7 @@ function ChannelManager({ channels = [], onRefresh }) {
         telegramChannelId: '',
         isActive: true,
         isPaused: false,
+  autoExecute: false,
         maxPositionPercentage: 100,
         riskPercentage: 2,
         tpPercentages: [25.0, 25.0, 50.0]
@@ -72,6 +74,7 @@ function ChannelManager({ channels = [], onRefresh }) {
         telegramChannelId: channel.telegramChannelId,
         isActive: channel.isActive,
         isPaused: channel.isPaused,
+  autoExecute: !!channel.autoExecute,
         maxPositionPercentage: channel.maxPositionPercentage || 100,
         riskPercentage: channel.riskPercentage || 2,
         tpPercentages: channel.tpPercentages || [25.0, 25.0, 50.0]
@@ -140,6 +143,7 @@ function ChannelManager({ channels = [], onRefresh }) {
         telegramChannelId: '',
         isActive: true,
         isPaused: false,
+  autoExecute: false,
         maxPositionPercentage: 100,
         riskPercentage: 2,
         tpPercentages: [25.0, 25.0, 50.0]
@@ -173,6 +177,19 @@ function ChannelManager({ channels = [], onRefresh }) {
 
           alert(errorMessage);
         }
+      }
+    };
+
+    const toggleAutoExecute = async (channel) => {
+      try {
+        await apiCall(`/channels/${channel.id}`, {
+          method: 'PUT',
+          body: { autoExecute: !channel.autoExecute }
+        });
+        if (onRefresh) onRefresh();
+      } catch (error) {
+        console.error('Failed to toggle auto-execution:', error);
+        alert('Ошибка при переключении режима следования сигналам');
       }
     };
 
@@ -213,13 +230,22 @@ function ChannelManager({ channels = [], onRefresh }) {
                   </div>
                 </div>
                 
-                <div className={`px-3 py-1 rounded-full text-xs font-medium ${
-                  channel.isActive && !channel.isPaused 
-                    ? 'bg-[var(--secondary-color)]/20 text-[var(--secondary-color)]'
-                    : 'bg-[var(--accent-color)]/20 text-[var(--accent-color)]'
-                }`}>
-                  {channel.isActive && !channel.isPaused ? 'Активен' : 'Приостановлен'}
-                </div>
+                  <div className="flex items-center space-x-2">
+                    <div className={`px-3 py-1 rounded-full text-xs font-medium ${
+                      channel.isActive && !channel.isPaused 
+                        ? 'bg-[var(--secondary-color)]/20 text-[var(--secondary-color)]'
+                        : 'bg-[var(--accent-color)]/20 text-[var(--accent-color)]'
+                    }`}>
+                      {channel.isActive && !channel.isPaused ? 'Активен' : 'Приостановлен'}
+                    </div>
+                    <div className={`px-3 py-1 rounded-full text-xs font-medium ${
+                      channel.autoExecute
+                        ? 'bg-emerald-500/20 text-emerald-400'
+                        : 'bg-sky-500/20 text-sky-400'
+                    }`} title="Режим следования сигналам">
+                      {channel.autoExecute ? 'Авто' : 'Ручной'}
+                    </div>
+                  </div>
               </div>
 
               {/* Channel Stats */}
@@ -244,6 +270,17 @@ function ChannelManager({ channels = [], onRefresh }) {
 
               {/* Channel Actions */}
               <div className="flex space-x-2 pt-4 border-t border-[var(--border-color)]">
+                <button
+                  onClick={() => toggleAutoExecute(channel)}
+                  className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+                    channel.autoExecute
+                      ? 'bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20'
+                      : 'bg-sky-500/10 text-sky-400 hover:bg-sky-500/20'
+                  }`}
+                  title="Переключить режим Авто/Ручной"
+                >
+                  {channel.autoExecute ? 'Отключить авто' : 'Включить авто'}
+                </button>
                 <button
                   onClick={() => toggleChannelStatus(channel)}
                   className={`flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
@@ -344,6 +381,25 @@ function ChannelManager({ channels = [], onRefresh }) {
                       </div>
                     </div>
                   )}
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-[var(--text-primary)] mb-2">
+                    Режим следования сигналам
+                  </label>
+                  <div className="flex items-center justify-between p-3 bg-[var(--surface-dark)] rounded-lg border border-[var(--border-color)]">
+                    <span className="text-sm text-[var(--text-secondary)]">Автоматическое исполнение</span>
+                    <label className="inline-flex items-center cursor-pointer">
+                      <input
+                        type="checkbox"
+                        className="sr-only peer"
+                        checked={!!formData.autoExecute}
+                        onChange={(e) => setFormData({ ...formData, autoExecute: e.target.checked })}
+                      />
+                      <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-gray-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-500 relative"></div>
+                      <span className="ml-3 text-sm font-medium text-[var(--text-primary)]">{formData.autoExecute ? 'Включено' : 'Выключено'}</span>
+                    </label>
+                  </div>
                 </div>
 
                 <div>

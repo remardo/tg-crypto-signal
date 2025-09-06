@@ -98,6 +98,11 @@ class Signal {
   static async create(signalData) {
     const id = uuidv4();
     
+    // Validate required fields
+    if (!signalData.coin) {
+      throw new Error('Coin is required for signal creation');
+    }
+    
     // Helper function to clean numeric values
     const cleanNumeric = (value) => {
       if (!value) return null;

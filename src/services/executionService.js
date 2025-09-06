@@ -179,18 +179,29 @@ class ExecutionService {
       }
 
       // set leverage (в отдельном запросе)
-      await this.setLeverageSafely(symbol, signal.leverage, subAccountId);
+      await this.setLeverageSafely(symbol, signal.leverage, signal.direction, subAccountId);
 
       // основной ордер
       const effectiveSubAccountId = subAccountId && subAccountId !== 'main_account' ? subAccountId : null;
       const orderResult = await this.placeOrder(signal, positionSize, symbol, effectiveSubAccountId);
 
       // Wait for the position to be actually opened on the exchange before creating a local one
-      const appeared = await this.waitForExchangePosition(symbol, effectiveSubAccountId, 8000);
+      const appeared = await this.waitForExchangePosition(symbol, effectiveSubAccountId, 15000);
+      
+      // If position didn't appear but order is FILLED, continue anyway
       if (!appeared) {
-        const msg = 'Entry order not confirmed on exchange within timeout';
-        logger.warn(msg, { symbol, orderId: orderResult.orderId, status: orderResult.status });
-        throw new Error(msg);
+        if (orderResult.status === 'FILLED') {
+          logger.warn('Position not found but order is FILLED, continuing execution', { 
+            symbol, 
+            orderId: orderResult.orderId, 
+            status: orderResult.status,
+            executedQty: orderResult.executedQty
+          });
+        } else {
+          const msg = 'Entry order not confirmed on exchange within timeout';
+          logger.warn(msg, { symbol, orderId: orderResult.orderId, status: orderResult.status });
+          throw new Error(msg);
+        }
       }
 
       // fetch fresh exchange position details to capture entryPrice/side accurately
@@ -376,14 +387,18 @@ class ExecutionService {
     return { isValid: errors.length === 0, errors };
   }
 
-  async setLeverageSafely(symbol, leverage, subAccountId) {
+  async setLeverageSafely(symbol, leverage, direction, subAccountId) {
     try {
       if (!leverage || leverage <= 1) return;
-      await this.bingx.setLeverage(symbol, leverage, subAccountId);
-      logger.info('Leverage set', { symbol, leverage });
+      
+      // Determine side from direction
+      const side = direction === 'LONG' ? 'LONG' : direction === 'SHORT' ? 'SHORT' : 'BOTH';
+      
+      await this.bingx.setLeverage(symbol, leverage, side, subAccountId);
+      logger.info('Leverage set', { symbol, leverage, side });
     } catch (e) {
       logger.warn(`Skipping leverage setting for ${symbol} due to API issues`, {
-        requestedLeverage: leverage, symbol
+        requestedLeverage: leverage, symbol, direction
       });
     }
   }
@@ -411,8 +426,26 @@ class ExecutionService {
         clientOrderId: `sig_${Date.now()}`
       };
 
-      // Remove TP1 and SL from main order - they will be placed as separate orders
-      // This ensures clean separation: 1 main order + 1 SL + 3 TPs
+      // Temporarily disable TP/SL in main order to test basic functionality
+      // TODO: Re-enable TP/SL in main order once BingX API supports it properly
+      // if (signal.takeProfitLevels && signal.takeProfitLevels.length > 0) {
+      //   const firstTP = signal.takeProfitLevels[0];
+      //   orderData.takeProfit = {
+      //     type: 'TAKE_PROFIT_MARKET',
+      //     stopPrice: parseFloat(firstTP.price || firstTP),
+      //     price: parseFloat(firstTP.price || firstTP),
+      //     workingType: 'MARK_PRICE'
+      //   };
+      // }
+
+      // if (signal.stopLoss) {
+      //   orderData.stopLoss = {
+      //     type: 'STOP_MARKET',
+      //     stopPrice: parseFloat(signal.stopLoss),
+      //     price: parseFloat(signal.stopLoss),
+      //     workingType: 'MARK_PRICE'
+      //   };
+      // }
 
       const result = await this.bingx.placeOrder(orderData, subAccountId);
       return result;
@@ -448,6 +481,7 @@ class ExecutionService {
 
   /**
    * Создаём отдельный STOP_MARKET и TAKE_PROFIT_MARKET ордера (reduceOnly)
+   * Все TP уровни выставляются как отдельные conditional ордера
    * + включаем watcher для переноса стопа в BE после первого частичного тейка
    */
   async placeRiskManagementOrders(position, signal, subAccountId, channel, symbolInfo) {
@@ -504,18 +538,22 @@ class ExecutionService {
       }
 
       // ---- TAKE PROFITS (TP1, TP2, TP3) ----
+      // All TP levels are placed as separate conditional orders
       const tpPercentages = channel.tpPercentages || [25.0, 25.0, 50.0];
       const levels = Array.isArray(signal.takeProfitLevels) ? signal.takeProfitLevels : [];
       const sortedTp = [...levels].map(x => (typeof x === 'object' ? parseFloat(x.price) : parseFloat(x)))
         .filter((v) => Number.isFinite(v))
         .sort((a, b) => (position.side === 'BUY' ? a - b : b - a));
 
+      // Place ALL TP levels as separate orders (not skipping first one)
+      const tpLevelsToPlace = sortedTp;
+
       // распределяем количества по всем TP уровням (TP1, TP2, TP3)
       const originalQty = this.roundToStepSize(position.quantity, stepSize);
       let remainingQty = originalQty;
 
-      for (let i = 0; i < sortedTp.length && i < tpPercentages.length; i += 1) { // с TP1
-        const tpPrice = sortedTp[i];
+      for (let i = 0; i < tpLevelsToPlace.length && i < tpPercentages.length; i += 1) { // с TP1
+        const tpPrice = tpLevelsToPlace[i];
         let tpQty = this.calculateTPQuantity(originalQty, i, tpPercentages);
 
         // min order value защитно (BingX ~3.72 USDT)
@@ -803,25 +841,44 @@ class ExecutionService {
     return Math.floor(quantity / stepSize) * stepSize;
   }
 
-  async waitForExchangePosition(symbol, subAccountId = null, timeoutMs = 8000) {
+  async waitForExchangePosition(symbol, subAccountId = null, timeoutMs = 15000) {
     // In mock mode, skip waiting to keep dev/test fast
     try { if (this.bingx && this.bingx.mode === 'mock') return true; } catch (e) {}
     const start = Date.now();
     const poll = 1000;
     const formatted = this.formatSymbol(symbol);
+    let attempts = 0;
+    
+    logger.info('Waiting for exchange position to appear', { symbol: formatted, timeoutMs });
+    
     while (Date.now() - start < timeoutMs) {
+      attempts++;
       try {
         const positions = await this.bingx.getPositions(subAccountId);
         if (Array.isArray(positions)) {
           const p = positions.find((x) => x.symbol === formatted && x.size && Math.abs(x.size) > 0);
-          if (p) return true;
+          if (p) {
+            logger.info('Exchange position appeared', { 
+              symbol: formatted, 
+              size: p.size, 
+              attempts, 
+              timeMs: Date.now() - start 
+            });
+            return true;
+          }
         }
       } catch (e) {
-        // ignore transient errors during poll
+        logger.warn('Error checking positions during wait', { symbol: formatted, error: e.message, attempt: attempts });
       }
       // eslint-disable-next-line no-await-in-loop
       await new Promise((r) => setTimeout(r, poll));
     }
+    
+    logger.error('Exchange position did not appear within timeout', { 
+      symbol: formatted, 
+      attempts, 
+      timeoutMs 
+    });
     return false;
   }
 

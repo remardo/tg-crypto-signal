@@ -87,7 +87,8 @@ class TradeExecutionService {
     // плечо ставим отдельно
     try {
       if (leverage && leverage > 1) {
-        await this.bingx.setLeverage(symbol, leverage, subAccountId);
+        const side = direction === 'LONG' ? 'LONG' : direction === 'SHORT' ? 'SHORT' : 'BOTH';
+        await this.bingx.setLeverage(symbol, leverage, side, subAccountId);
       }
     } catch (e) {
       logger.warn('setLeverage skipped', { error: e.message });

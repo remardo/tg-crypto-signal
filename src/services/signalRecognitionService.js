@@ -1,11 +1,13 @@
 const OpenAI = require('openai');
 const config = require('../config/app');
 const { logger, signal: signalLog } = require('../utils/logger');
+const BingXService = require('./bingxService');
 
 class SignalRecognitionService {
   constructor() {
     this.openai = null;
     this.initialized = false;
+    this.bingxService = new BingXService();
   }
 
   async initialize() {
@@ -18,6 +20,9 @@ class SignalRecognitionService {
         apiKey: config.openai.apiKey,
         timeout: config.openai.timeout,
       });
+
+      // Initialize BingX service for coin validation
+      await this.bingxService.initialize();
 
       this.initialized = true;
       logger.info('Signal recognition service initialized successfully');
@@ -193,6 +198,78 @@ Respond with JSON in this exact format:
 }`;
   }
 
+  // Fuzzy coin matching against supported symbols
+  fuzzyCoinMatch(extractedCoin) {
+    if (!extractedCoin || !this.bingxService.supportedSymbols.length) {
+      return extractedCoin;
+    }
+
+    const normalizedCoin = extractedCoin.toUpperCase().replace(/[^A-Z0-9]/g, '');
+    
+    // Exact match first
+    const exactMatch = this.bingxService.supportedSymbols.find(s => 
+      s.symbol === normalizedCoin || 
+      s.baseAsset === normalizedCoin ||
+      s.symbol.replace('-', '') === normalizedCoin
+    );
+    
+    if (exactMatch) {
+      return exactMatch.symbol;
+    }
+
+    // Fuzzy matching with Levenshtein distance
+    let bestMatch = null;
+    let bestDistance = Infinity;
+    
+    for (const symbol of this.bingxService.supportedSymbols) {
+      if (!symbol.baseAsset) continue;
+      
+      const symbolBase = symbol.baseAsset;
+      const distance = this.levenshteinDistance(normalizedCoin, symbolBase);
+      
+      // Allow up to 2 character differences for short symbols, 3 for longer
+      const maxDistance = symbolBase.length <= 4 ? 2 : 3;
+      
+      if (distance <= maxDistance && distance < bestDistance) {
+        bestDistance = distance;
+        bestMatch = symbol.symbol;
+      }
+    }
+    
+    return bestMatch || extractedCoin;
+  }
+
+  // Calculate Levenshtein distance for fuzzy matching
+  levenshteinDistance(str1, str2) {
+    if (!str1 || !str2) return Infinity;
+    
+    const matrix = [];
+    
+    for (let i = 0; i <= str2.length; i++) {
+      matrix[i] = [i];
+    }
+    
+    for (let j = 0; j <= str1.length; j++) {
+      matrix[0][j] = j;
+    }
+    
+    for (let i = 1; i <= str2.length; i++) {
+      for (let j = 1; j <= str1.length; j++) {
+        if (str2.charAt(i - 1) === str1.charAt(j - 1)) {
+          matrix[i][j] = matrix[i - 1][j - 1];
+        } else {
+          matrix[i][j] = Math.min(
+            matrix[i - 1][j - 1] + 1, // substitution
+            matrix[i][j - 1] + 1,     // insertion
+            matrix[i - 1][j] + 1      // deletion
+          );
+        }
+      }
+    }
+    
+    return matrix[str2.length][str1.length];
+  }
+
   validateAndNormalizeResult(result, originalText) {
     try {
       // Ensure required fields exist
@@ -228,9 +305,10 @@ Respond with JSON in this exact format:
           extracted.direction = null;
         }
 
-        // Normalize coin symbol
+        // Normalize and fuzzy match coin symbol
         if (extracted.coin) {
-          extracted.coin = extracted.coin.toUpperCase().replace(/[^A-Z0-9]/g, '');
+          const normalizedCoin = extracted.coin.toUpperCase().replace(/[^A-Z0-9]/g, '');
+          extracted.coin = this.fuzzyCoinMatch(normalizedCoin);
         }
 
         // Validate take profit levels

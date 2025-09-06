@@ -287,6 +287,18 @@ class BingXService {
     }
   }
 
+  async getPositionMode(subAccountId = null) {
+    try {
+      // Use position mode from config
+      const positionMode = config.bingx.positionMode || 'one-way';
+      logger.debug(`Position mode from config: ${positionMode}`);
+      return positionMode;
+    } catch (error) {
+      logger.warn('Could not determine position mode, defaulting to one-way:', error.message);
+      return 'one-way';
+    }
+  }
+
   /* ---------------------------- Sub-Accounts ------------------------------- */
 
   async getSubAccounts() {
@@ -381,6 +393,19 @@ class BingXService {
         positionSide = orderData.side === 'BUY' ? 'LONG' : 'SHORT';
       }
 
+      // Validate conditional orders require stopPrice
+      const isConditional =
+        String(orderData.type).includes('STOP') || String(orderData.type).includes('TAKE_PROFIT');
+      if (isConditional && (orderData.stopPrice == null || Number(orderData.stopPrice) <= 0)) {
+        throw new Error(`Conditional order ${orderData.type} requires a valid stopPrice`);
+      }
+
+      // Check position mode to determine if reduceOnly can be used
+      const positionMode = await this.getPositionMode(subAccountId);
+      const isHedgeMode = positionMode === 'hedge';
+      
+      logger.debug(`Position mode check: mode=${positionMode}, isHedge=${isHedgeMode}, reduceOnly=${orderData.reduceOnly}`);
+      
       const params = {
         symbol: formattedSymbol,
         side: orderData.side,
@@ -391,23 +416,22 @@ class BingXService {
         // DO NOT send leverage here (set via setLeverage before placing order)
         ...(orderData.recvWindow && { recvWindow: orderData.recvWindow.toString() }),
         ...(orderData.clientOrderId && { clientOrderId: orderData.clientOrderId }),
-        ...(orderData.reduceOnly != null && { reduceOnly: String(orderData.reduceOnly) }),
-        ...(subAccountId && { subAccountId }),
+        // Only send reduceOnly in one-way mode, not in hedge mode
+        ...(!isHedgeMode && orderData.reduceOnly != null && { reduceOnly: String(orderData.reduceOnly) }),
+        // Don't send main/main_account strings; omit for main account
+        ...(subAccountId && subAccountId !== 'main' && subAccountId !== 'main_account' && { subAccountId }),
+        // Conditional order specifics
+        ...(isConditional && { stopPrice: String(orderData.stopPrice) }),
+        ...(isConditional && { workingType: orderData.workingType || 'MARK_PRICE' }),
       };
 
-      // TP/SL must be JSON strings
-      if (orderData.takeProfit) {
-        params.takeProfit =
-          typeof orderData.takeProfit === 'string'
-            ? orderData.takeProfit
-            : JSON.stringify(orderData.takeProfit);
-      }
-      if (orderData.stopLoss) {
-        params.stopLoss =
-          typeof orderData.stopLoss === 'string'
-            ? orderData.stopLoss
-            : JSON.stringify(orderData.stopLoss);
-      }
+      // TP/SL must be JSON strings - but let's try without them first to test basic functionality
+      // if (orderData.takeProfit) {
+      //   params.takeProfit = JSON.stringify(orderData.takeProfit, null, 0);
+      // }
+      // if (orderData.stopLoss) {
+      //   params.stopLoss = JSON.stringify(orderData.stopLoss, null, 0);
+      // }
 
       const result = await this.makeRequest('POST', endpoint, params);
 
@@ -543,13 +567,14 @@ class BingXService {
 
   /* --------------------------- Position / Leverage ------------------------- */
 
-  async setLeverage(symbol, leverage, subAccountId = null) {
+  async setLeverage(symbol, leverage, side, subAccountId = null) {
     try {
       const formattedSymbol = this.formatSymbol(symbol);
       const endpoint = '/openApi/swap/v2/trade/leverage';
       const params = {
         symbol: formattedSymbol,
         leverage: String(leverage),
+        side: side || 'BOTH', // Default to BOTH if not specified
         ...(subAccountId && { subAccountId }),
       };
 
@@ -558,6 +583,7 @@ class BingXService {
       tradeLog('leverage_set', {
         symbol: formattedSymbol,
         leverage,
+        side,
         subAccountId,
       });
 

@@ -54,8 +54,8 @@ function BalanceWidget() {
     React.useEffect(() => {
       loadBalance();
 
-      // Auto-refresh every 30 seconds
-      const interval = setInterval(loadBalance, 30000);
+      // Auto-refresh every 3 seconds
+      const interval = setInterval(loadBalance, 3000);
 
       return () => clearInterval(interval);
     }, []);

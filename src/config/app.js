@@ -55,6 +55,7 @@ const config = {
     apiKey: process.env.BINGX_API_KEY,
     secretKey: process.env.BINGX_SECRET_KEY,
     baseUrl: process.env.BINGX_BASE_URL || 'https://open-api.bingx.com',
+    positionMode: process.env.BINGX_POSITION_MODE || 'hedge', // 'hedge' or 'one-way'
     endpoints: {
       account: '/openApi/swap/v2/user/balance',
       positions: '/openApi/swap/v2/user/positions',

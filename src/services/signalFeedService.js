@@ -155,20 +155,33 @@ class SignalFeedService {
         status: this.determineSignalStatus(analysis, channel)
       };
 
-      const signal = await Signal.create(signalData);
+      // Only create signal if it's not ignored
+      if (signalData.status !== 'ignored') {
+        // Additional validation for entry signals
+        if (signalData.signalType === 'entry' && !signalData.coin) {
+          logger.warn(`Skipping entry signal without coin from channel ${channel.name}`);
+          return null;
+        }
+        
+        const signal = await Signal.create(signalData);
 
-      // Cache signal for quick access
-      await this.cacheSignal(signal);
+        // Cache signal for quick access
+        await this.cacheSignal(signal);
 
-      // Notify subscribers about new signal
-      await this.notifyNewSignal(signal, analysis);
+        // Notify subscribers about new signal
+        await this.notifyNewSignal(signal, analysis);
 
-      // Auto-execute if enabled and signal meets criteria
-      if (analysis.isSignal && channel.autoExecute && analysis.signalType === 'entry') {
-        await this.scheduleAutoExecution(signal);
+        // Auto-execute if enabled and signal meets criteria
+        if (analysis.isSignal && channel.autoExecute && analysis.signalType === 'entry') {
+          await this.scheduleAutoExecution(signal);
+        }
+
+        return signal;
+      } else {
+        // Log ignored signal for debugging
+        logger.debug(`Ignored signal from channel ${channel.name}: ${analysis.reasoning}`);
+        return null;
       }
-
-      return signal;
 
     } catch (error) {
       logger.error('Error processing message:', error);

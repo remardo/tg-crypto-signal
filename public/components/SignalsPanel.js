@@ -31,7 +31,12 @@ function SignalsPanel({ signals = [], onRefresh }) {
   // Execute signal
   const executeSignal = async (signalId) => {
     try {
-      await apiCall(`/signals/${signalId}/execute`, { method: 'POST' });
+      const resp = await apiCall(`/signals/${signalId}/execute`, { method: 'POST' });
+      if (typeof window !== 'undefined' && window.showNotification) {
+        window.showNotification('Сигнал отправлен на исполнение', 'success');
+      } else {
+        alert('✅ Сигнал отправлен на исполнение');
+      }
       if (onRefresh) onRefresh();
     } catch (error) {
       console.error('Failed to execute signal:', error);
